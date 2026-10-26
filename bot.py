@@ -7,7 +7,7 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import matplotlib
-matplotlib.use('Agg')  # Для работы без графического интерфейса
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import requests
@@ -19,7 +19,7 @@ from telebot.types import (
     ReplyKeyboardMarkup,
 )
 
-# Фоновый мини-сервер, чтобы Render держал сервис активным
+# Фоновый мини-сервер для Render
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -37,59 +37,79 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# Чтение ключей из переменных окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# ----------------- АКТУАЛЬНЫЕ ЭНДПОИНТЫ GEMINI API -----------------
+# ----------------- КОНФИГУРАЦИЯ МОДЕЛЕЙ (БЕЗ ПЛАТНОЙ 3.1 PRO) -----------------
 MODEL_TIMEOUTS = {
-    'gemini-2.0-flash-lite': 25,
+    'gemini-3.1-flash-lite-preview': 25,
+    'gemini-3-flash-preview': 45,
     'gemini-2.5-flash': 45,
-    'gemini-2.0-flash': 45,
-    'gemini-3.1-pro-preview': 120,
+    'gemini-2.5-flash-lite': 30,
 }
 
-# Пользовательские названия для меню
 MODEL_INFO = {
     'auto': '🔄 Авто (Умный перебор)',
-    'gemini-2.0-flash-lite': '🚀 3.5 Flash-Lite (Самые быстрые ответы)',
-    'gemini-2.5-flash': '⚡ 3.8 Flash (All-around help)',
-    'gemini-2.0-flash': '🔬 3.1 Pro (Расширенные возможности)',
-    'gemini-3.1-pro-preview': '🧠 4 Argon (Сложные задачи)',
+    'gemini-3.1-flash-lite-preview': '🚀 3.5 Flash-Lite (Самые быстрые ответы)',
+    'gemini-3-flash-preview': '⚡ 3.8 Flash (All-around help)',
+    'gemini-2.5-flash': '🔬 3.1 Pro (Расширенные возможности)',
+    'gemini-2.5-flash-lite': '🧠 4 Argon (Сложные задачи)',
 }
 
 FALLBACK_ORDER = [
+    'gemini-3-flash-preview',
+    'gemini-3.1-flash-lite-preview',
     'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-lite',
-    'gemini-3.1-pro-preview',
+    'gemini-2.5-flash-lite',
 ]
 
 user_models = {}
+cached_available_models = []
 
 def get_user_model(chat_id):
     return user_models.get(chat_id, 'auto')
 
+def fetch_available_models():
+    """Запрашивает у Google точный список моделей, доступных вашему ключу"""
+    global cached_available_models
+    try:
+        url = f'https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}'
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            models = []
+            for m in data.get('models', []):
+                methods = m.get('supportedGenerationMethods', [])
+                name = m.get('name', '').replace('models/', '')
+                # Берем только модели для генерации текста и исключаем платные pro с нулевым лимитом
+                if 'generateContent' in methods and 'gemini' in name and 'pro' not in name and 'vision' not in name and 'embedding' not in name and 'imagen' not in name and 'tts' not in name:
+                    models.append(name)
+            if models:
+                cached_available_models = models
+            return models
+    except Exception as e:
+        print(f"Ошибка получения списка моделей: {e}")
+    return []
+
+# Загружаем доступные модели при старте бота
+fetch_available_models()
+
 # ----------------- ХРАНИЛИЩЕ КОНТЕКСТА (ПАМЯТЬ) -----------------
 user_context = {}
-MAX_HISTORY = 10  # Хранить последние 10 сообщений диалога
+MAX_HISTORY = 10
 
 def add_to_context(chat_id, role, text):
-    """Добавляет сообщение пользователя или ассистента в историю"""
     if chat_id not in user_context:
         user_context[chat_id] = []
-    
     user_context[chat_id].append({"role": role, "text": text})
     if len(user_context[chat_id]) > MAX_HISTORY:
         user_context[chat_id] = user_context[chat_id][-MAX_HISTORY:]
 
 def get_context_as_prompt(chat_id):
-    """Преобразует историю переписки в диалоговый текст"""
     if chat_id not in user_context or not user_context[chat_id]:
         return ""
-    
     formatted = []
     for item in user_context[chat_id]:
         role_label = "Пользователь" if item["role"] == "user" else "Ассистент"
@@ -97,7 +117,6 @@ def get_context_as_prompt(chat_id):
     return "\n".join(formatted)
 
 def clear_context(chat_id):
-    """Очищает память беседы"""
     user_context[chat_id] = []
 
 # ----------------- КЛАВИАТУРЫ И МЕНЮ -----------------
@@ -106,15 +125,14 @@ def get_main_keyboard(chat_id):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     current_model_key = get_user_model(chat_id)
     
-    # Короткое название для кнопки
     short_names = {
         'auto': 'Авто',
-        'gemini-2.0-flash-lite': '3.5 Flash-Lite',
-        'gemini-2.5-flash': '3.8 Flash',
-        'gemini-2.0-flash': '3.1 Pro',
-        'gemini-3.1-pro-preview': '4 Argon',
+        'gemini-3.1-flash-lite-preview': '3.5 Flash-Lite',
+        'gemini-3-flash-preview': '3.8 Flash',
+        'gemini-2.5-flash': '3.1 Pro',
+        'gemini-2.5-flash-lite': '4 Argon',
     }
-    model_name_short = short_names.get(current_model_key, '3.8 Flash')
+    model_name_short = short_names.get(current_model_key, 'Авто')
     
     btn_model = KeyboardButton(f"📝 Модель: {model_name_short}")
     btn_new = KeyboardButton("🔄 Новый диалог")
@@ -126,7 +144,7 @@ def get_main_keyboard(chat_id):
 
 def send_settings_menu(chat_id):
     current_model_key = get_user_model(chat_id)
-    model_label = MODEL_INFO.get(current_model_key, 'Авто')
+    model_label = MODEL_INFO.get(current_model_key, '🔄 Авто (Умный перебор)')
 
     settings_text = (
         "⚙️ *Панель настроек*\n\n"
@@ -181,10 +199,16 @@ def call_single_model_http(model, parts, system_text):
 
 def ask_gemini_smart(chat_id, parts, system_text):
     chosen = get_user_model(chat_id)
-    models_to_try = (
+    base_list = (
         FALLBACK_ORDER if chosen == 'auto'
         else [chosen] + [m for m in FALLBACK_ORDER if m != chosen]
     )
+    
+    # Добавляем все реально найденные у ключа Flash-модели как страховку
+    if not cached_available_models:
+        fetch_available_models()
+    
+    models_to_try = list(dict.fromkeys(base_list + cached_available_models))
 
     last_error = ''
     for model in models_to_try:
@@ -195,8 +219,8 @@ def ask_gemini_smart(chat_id, parts, system_text):
             last_error = f'Превышен лимит {limit_sec} сек'
         except Exception as e:
             last_error = str(e)
-            if '503' in last_error or '429' in last_error:
-                time.sleep(2)
+            if '503' in last_error:
+                time.sleep(1)
 
     raise Exception(f'Не удалось получить ответ. Причина: {last_error}')
 
@@ -230,6 +254,15 @@ def send_welcome(message):
         'Добро пожаловать в BananGPT! 🍌\nКонтекст беседы сброшен. Чем могу помочь?',
         reply_markup=get_main_keyboard(message.chat.id)
     )
+
+@bot.message_handler(commands=['models'])
+def show_available_api_models(message):
+    models = fetch_available_models()
+    if models:
+        text = "✅ Доступные Flash-модели на вашем API-ключе:\n\n" + "\n".join(f"• `{m}`" for m in models)
+    else:
+        text = "❌ Не удалось получить список моделей."
+    bot.reply_to(message, text, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data == "show_help")
 def process_help(call):
@@ -287,7 +320,6 @@ def handle_model_selection(call):
 def handle_text(message):
     text_lower = message.text.lower()
     
-    # Кнопки клавиатуры
     if message.text == '⚙️ Настройки':
         send_settings_menu(message.chat.id)
         return
@@ -366,10 +398,7 @@ def handle_text(message):
             os.remove(file_name)
 
         else:
-            # 1. Запоминаем вопрос пользователя
             add_to_context(message.chat.id, "user", message.text)
-
-            # 2. Формируем запрос с учетом памяти
             history_str = get_context_as_prompt(message.chat.id)
             full_prompt = (
                 "Ты умный и полезный ассистент BananGPT. "
@@ -382,8 +411,6 @@ def handle_text(message):
             )
 
             reply_text = ask_gemini_smart(message.chat.id, [{'text': full_prompt}], "Отвечай строго по сути, соблюдая контекст беседы.")
-            
-            # 3. Сохраняем ответ модели в контекст
             add_to_context(message.chat.id, "model", reply_text)
 
             bot.delete_message(message.chat.id, wait_msg.message_id)
@@ -426,7 +453,6 @@ def handle_files(message):
         system_text = "Проанализируй файл кратко и чётко. Без знаков $ и LaTeX."
         reply_text = ask_gemini_smart(message.chat.id, parts, system_text)
         
-        # Сохраняем файл в контекст
         add_to_context(message.chat.id, "user", f"[Пользователь отправил файл/фото]: {prompt}")
         add_to_context(message.chat.id, "model", reply_text)
 
