@@ -19,12 +19,16 @@ from telebot.types import (
     ReplyKeyboardMarkup,
 )
 
-# Фоновый мини-сервер, чтобы Render не ругался на отсутствие портов
+# Фоновый мини-сервер, чтобы Render держал сервис активным
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
@@ -33,32 +37,32 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# Безопасное чтение ключей (GitHub не будет блокировать)
+# Чтение ключей из переменных окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 MODEL_TIMEOUTS = {
-    'gemini-4-argon': 180,
-    'gemini-3.1-pro': 120,
-    'gemini-3.8-flash': 40,
-    'gemini-3.5-flash-lite': 20,
+    'gemini-2.5-flash': 40,
+    'gemini-2.5-pro': 120,
+    'gemini-2.0-flash': 30,
+    'gemini-1.5-flash': 30,
 }
 
 MODEL_INFO = {
     'auto': '🔄 Авто (Умный перебор со своими лимитами)',
-    'gemini-4-argon': f'🧠 4 Argon (Сложные задачи — до {MODEL_TIMEOUTS["gemini-4-argon"]} сек)',
-    'gemini-3.1-pro': f'🔬 3.1 Pro (Рассуждения — до {MODEL_TIMEOUTS["gemini-3.1-pro"]} сек)',
-    'gemini-3.8-flash': f'⚡ 3.8 Flash (Универсальная — до {MODEL_TIMEOUTS["gemini-3.8-flash"]} сек)',
-    'gemini-3.5-flash-lite': f'🚀 3.5 Flash-Lite (Мгновенная — до {MODEL_TIMEOUTS["gemini-3.5-flash-lite"]} сек)',
+    'gemini-2.5-flash': f'⚡ 2.5 Flash (Универсальная — до {MODEL_TIMEOUTS["gemini-2.5-flash"]} сек)',
+    'gemini-2.5-pro': f'🔬 2.5 Pro (Глубокие рассуждения — до {MODEL_TIMEOUTS["gemini-2.5-pro"]} сек)',
+    'gemini-2.0-flash': f'🚀 2.0 Flash (Быстрая — до {MODEL_TIMEOUTS["gemini-2.0-flash"]} сек)',
+    'gemini-1.5-flash': f'🧠 1.5 Flash (Надежная — до {MODEL_TIMEOUTS["gemini-1.5-flash"]} сек)',
 }
 
 FALLBACK_ORDER = [
-    'gemini-4-argon',
-    'gemini-3.1-pro',
-    'gemini-3.8-flash',
-    'gemini-3.5-flash-lite',
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
 ]
 
 user_models = {}
@@ -66,55 +70,70 @@ user_models = {}
 def get_user_model(chat_id):
     return user_models.get(chat_id, 'auto')
 
-# ----------------- НОВЫЙ ИНТЕРФЕЙС -----------------
+# ----------------- ХРАНИЛИЩЕ КОНТЕКСТА (ПАМЯТЬ) -----------------
+user_context = {}
+MAX_HISTORY = 10  # Хранить последние 10 сообщений (5 запросов и 5 ответов)
+
+def add_to_context(chat_id, role, text):
+    """Добавляет реплику пользователя или модели в память"""
+    if chat_id not in user_context:
+        user_context[chat_id] = []
+    
+    user_context[chat_id].append({"role": role, "text": text})
+    if len(user_context[chat_id]) > MAX_HISTORY:
+        user_context[chat_id] = user_context[chat_id][-MAX_HISTORY:]
+
+def get_context_as_prompt(chat_id):
+    """Преобразует историю переписки в диалог"""
+    if chat_id not in user_context or not user_context[chat_id]:
+        return ""
+    
+    formatted = []
+    for item in user_context[chat_id]:
+        role_label = "Пользователь" if item["role"] == "user" else "Ассистент"
+        formatted.append(f"{role_label}: {item['text']}")
+    return "\n".join(formatted)
+
+def clear_context(chat_id):
+    """Очищает историю диалога"""
+    user_context[chat_id] = []
+
+# ----------------- КЛАВИАТУРЫ И ИНТЕРФЕЙС -----------------
 
 def get_main_keyboard(chat_id):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     current_model_key = get_user_model(chat_id)
-    # Показываем текущую реальную модель в кнопке
     model_name_short = current_model_key.replace("gemini-", "").replace("-", " ").title() if current_model_key != 'auto' else 'Авто'
     
     btn_model = KeyboardButton(f"📝 Модель: {model_name_short}")
-    markup.add(btn_model)
-    
     btn_new = KeyboardButton("🔄 Новый диалог")
-    btn_role = KeyboardButton("🎭 Роль")
-    markup.row(btn_new, btn_role)
-    
     btn_settings = KeyboardButton("⚙️ Настройки")
-    markup.add(btn_settings)
+    
+    markup.row(btn_model)
+    markup.row(btn_new, btn_settings)
     return markup
 
 def send_settings_menu(chat_id):
+    current_model_key = get_user_model(chat_id)
+    model_label = MODEL_INFO.get(current_model_key, 'Авто')
+
     settings_text = (
-        "⚙️ Настройки нового диалога\n\n"
-        "🤖 Текстовая модель: по умолчанию\n"
-        "🎭 Роль: не выбрана\n"
-        "🛠 Инструменты: выключены\n\n"
-        "/stt - распознавание речи 🎙\n"
-        "/text - диалоговые модели 💬\n"
-        "/dialogs - список диалогов 📁\n\n"
-        "Выберите, что изменить. Настройки применятся к следующему новому диалогу."
+        "⚙️ *Панель настроек*\n\n"
+        f"🤖 Активная модель: *{model_label}*\n"
+        f"🧠 Память контекста: *Включена* (до {MAX_HISTORY} реплик)\n\n"
+        "Выберите необходимое действие:"
     )
     markup = InlineKeyboardMarkup()
-    btn_model = InlineKeyboardButton("🤖 Модель", callback_data="open_models")
-    btn_role = InlineKeyboardButton("🎭 Роль", callback_data="stub")
-    markup.row(btn_model, btn_role)
-    
-    btn_tools = InlineKeyboardButton("🛠 Инструменты", callback_data="stub")
-    markup.add(btn_tools)
-    
-    btn_interface = InlineKeyboardButton("Изменить интерфейс", callback_data="stub")
-    markup.add(btn_interface)
+    btn_model = InlineKeyboardButton("🤖 Выбрать модель", callback_data="open_models")
+    btn_reset = InlineKeyboardButton("🔄 Очистить контекст", callback_data="reset_context_inline")
+    markup.row(btn_model)
+    markup.row(btn_reset)
     
     btn_help = InlineKeyboardButton("❓ Помощь", callback_data="show_help")
-    markup.add(btn_help)
-    
-    btn_reset = InlineKeyboardButton("🔄 Сбросить", callback_data="stub")
     btn_close = InlineKeyboardButton("❌ Закрыть", callback_data="close_settings")
-    markup.row(btn_reset, btn_close)
+    markup.row(btn_help, btn_close)
     
-    bot.send_message(chat_id, settings_text, reply_markup=markup)
+    bot.send_message(chat_id, settings_text, parse_mode='Markdown', reply_markup=markup)
 
 def get_model_inline_keyboard(current_model):
     markup = InlineKeyboardMarkup(row_width=1)
@@ -145,7 +164,7 @@ def call_single_model_http(model, parts, system_text):
         reply_text = '\n'.join(texts).strip()
         if reply_text:
             return reply_text
-    raise Exception(f'Код {resp.status_code}')
+    raise Exception(f'Код {resp.status_code}: {resp.text}')
 
 def ask_gemini_smart(chat_id, parts, system_text):
     chosen = get_user_model(chat_id)
@@ -188,33 +207,39 @@ def send_long_message(message, text):
     for i in range(0, len(text), 4000):
         bot.reply_to(message, text[i:i + 4000], reply_markup=get_main_keyboard(message.chat.id))
 
-# ----------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -----------------
+# ----------------- ОБРАБОТЧИКИ TELEGRAM -----------------
 
 @bot.message_handler(commands=['start', 'model'])
 def send_welcome(message):
+    clear_context(message.chat.id)
     bot.send_message(
         message.chat.id,
-        'Добро пожаловать в приватный ИИ-ассистент! 🍌\nВыберите действие в меню ниже👇',
+        'Добро пожаловать в BananGPT! 🍌\nКонтекст беседы сброшен. Чем могу помочь?',
         reply_markup=get_main_keyboard(message.chat.id)
     )
 
 @bot.callback_query_handler(func=lambda call: call.data == "show_help")
 def process_help(call):
     help_text = (
-        "С возвращением!\n\n"
-        "1. Бот забыл диалог или отключилась память?\n"
-        "Все диалоги сохраняются. Откройте команду /dialogs, выбирайте сохраненные диалоги, чтобы посмотреть их.\n\n"
-        "2. Запутались в настройках?\n"
-        "Нижняя клавиатура бота всегда показывает текущие активные настройки.\n\n"
-        "3. Техподдержка и вопросы\n"
-        "Бот абсолютно бесплатный и сделан для своих. Если что-то сломалось, зависло или нужна помощь — пиши мне: @isrustoy"
+        "💡 *Справка по боту*\n\n"
+        "1. *Контекст диалога:*\n"
+        "Бот помнит суть текущего разговора. Чтобы начать новую тему без старых хвостов — нажмите «🔄 Новый диалог».\n\n"
+        "2. *Выбор модели:*\n"
+        "Вы можете переключаться между моделями линейки Gemini через меню настроек или кнопку на клавиатуре.\n\n"
+        "3. *Поддержка:* @isrustoy"
     )
-    bot.send_message(call.message.chat.id, help_text)
+    bot.send_message(call.message.chat.id, help_text, parse_mode='Markdown')
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "close_settings")
 def process_close(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "reset_context_inline")
+def process_reset_context(call):
+    clear_context(call.message.chat.id)
+    bot.answer_callback_query(call.id, "Контекст диалога очищен!")
+    bot.send_message(call.message.chat.id, "🔄 Контекст диалога очищен. Можем начать новую тему!")
 
 @bot.callback_query_handler(func=lambda call: call.data == "open_models")
 def process_open_models(call):
@@ -230,10 +255,6 @@ def process_open_models(call):
 def process_back_settings(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     send_settings_menu(call.message.chat.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "stub")
-def process_stub(call):
-    bot.answer_callback_query(call.id, "Эта функция пока в разработке 🛠")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('setmodel:'))
 def handle_model_selection(call):
@@ -253,19 +274,25 @@ def handle_model_selection(call):
 def handle_text(message):
     text_lower = message.text.lower()
     
-    # Обработка кнопок интерфейса
+    # Реакция на основные кнопки клавиатуры
     if message.text == '⚙️ Настройки':
         send_settings_menu(message.chat.id)
         return
     elif message.text == '🔄 Новый диалог':
-        bot.send_message(message.chat.id, "✅ Контекст диалога очищен! Можем начать новую тему.", reply_markup=get_main_keyboard(message.chat.id))
-        return
-    elif message.text == '🎭 Роль':
-        bot.send_message(message.chat.id, "Меню выбора ролей находится в разработке 🛠")
+        clear_context(message.chat.id)
+        bot.send_message(
+            message.chat.id, 
+            "✅ Контекст диалога очищен! Можем начать новую тему.", 
+            reply_markup=get_main_keyboard(message.chat.id)
+        )
         return
     elif message.text.startswith('📝 Модель:'):
         current = get_user_model(message.chat.id)
-        bot.send_message(message.chat.id, "Выберите текстовую модель:", reply_markup=get_model_inline_keyboard(current))
+        bot.send_message(
+            message.chat.id, 
+            "Выберите текстовую модель:", 
+            reply_markup=get_model_inline_keyboard(current)
+        )
         return
 
     print(f'\n📥 Сообщение: {message.text}')
@@ -285,7 +312,7 @@ def handle_text(message):
             )
             response_text = ask_gemini_smart(message.chat.id, [{'text': message.text}], system_text)
             
-            code_match = re.search(r'```python(.*?)```', response_text, DOTALL := re.DOTALL) if True else None
+            code_match = re.search(r'```python(.*?)```', response_text, re.DOTALL)
             code_success = False
             
             if code_match:
@@ -326,13 +353,26 @@ def handle_text(message):
             os.remove(file_name)
 
         else:
-            system_text = (
-                'Отвечай максимально кратко, чётко, по делу, без "воды". '
-                'СТРОГО ЗАПРЕЩЕНО использовать знаки доллара ($), квадратные скобки для формул и любые символы LaTeX. '
-                'Пиши все формулы обычным текстом (например: B = F / (I * l)). '
-                'Никаких лишних технических символов.'
+            # Запоминаем вопрос пользователя
+            add_to_context(message.chat.id, "user", message.text)
+
+            # Формируем запрос с учетом памяти
+            history_str = get_context_as_prompt(message.chat.id)
+            full_prompt = (
+                "Ты умный и полезный ассистент BananGPT. "
+                "Ниже приведена история текущего диалога с пользователем. "
+                "Используй ее для понимания темы, местоимений и уточняющих вопросов.\n\n"
+                f"--- ИСТОРИЯ ДИАЛОГА ---\n{history_str}\n--- КОНЕЦ ИСТОРИИ ---\n\n"
+                "Ответь на последнюю реплику пользователя максимально кратко, чётко, по делу, без 'воды'. "
+                "СТРОГО ЗАПРЕЩЕНО использовать знаки доллара ($), квадратные скобки для формул и любые символы LaTeX. "
+                "Пиши все формулы обычным текстом (например: B = F / (I * l))."
             )
-            reply_text = ask_gemini_smart(message.chat.id, [{'text': message.text}], system_text)
+
+            reply_text = ask_gemini_smart(message.chat.id, [{'text': full_prompt}], "Отвечай строго по сути, соблюдая контекст беседы.")
+            
+            # Сохраняем ответ в память
+            add_to_context(message.chat.id, "model", reply_text)
+
             bot.delete_message(message.chat.id, wait_msg.message_id)
             send_long_message(message, reply_text)
 
@@ -372,6 +412,11 @@ def handle_files(message):
 
         system_text = "Проанализируй файл кратко и чётко. Без знаков $ и LaTeX."
         reply_text = ask_gemini_smart(message.chat.id, parts, system_text)
+        
+        # Сохраняем файл в контекст
+        add_to_context(message.chat.id, "user", f"[Пользователь отправил файл/фото]: {prompt}")
+        add_to_context(message.chat.id, "model", reply_text)
+
         bot.delete_message(message.chat.id, wait_msg.message_id)
         send_long_message(message, reply_text)
         print('📤 Ответ по файлу отправлен в Telegram!')
