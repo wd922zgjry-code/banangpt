@@ -43,26 +43,28 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
+# Реальные рабочие модели Google API и их таймауты
 MODEL_TIMEOUTS = {
+    'gemini-2.5-flash-lite': 20,
     'gemini-2.5-flash': 40,
     'gemini-2.5-pro': 120,
-    'gemini-2.0-flash': 30,
-    'gemini-1.5-flash': 30,
+    'gemini-2.0-pro-exp-02-05': 180,
 }
 
+# Пользовательские названия для меню (в точности по вашему списку)
 MODEL_INFO = {
-    'auto': '🔄 Авто (Умный перебор со своими лимитами)',
-    'gemini-2.5-flash': f'⚡ 2.5 Flash (Универсальная — до {MODEL_TIMEOUTS["gemini-2.5-flash"]} сек)',
-    'gemini-2.5-pro': f'🔬 2.5 Pro (Глубокие рассуждения — до {MODEL_TIMEOUTS["gemini-2.5-pro"]} сек)',
-    'gemini-2.0-flash': f'🚀 2.0 Flash (Быстрая — до {MODEL_TIMEOUTS["gemini-2.0-flash"]} сек)',
-    'gemini-1.5-flash': f'🧠 1.5 Flash (Надежная — до {MODEL_TIMEOUTS["gemini-1.5-flash"]} сек)',
+    'auto': '🔄 Авто (Умный перебор)',
+    'gemini-2.5-flash-lite': '🚀 3.5 Flash-Lite (Самые быстрые ответы)',
+    'gemini-2.5-flash': '⚡ 3.8 Flash (All-around help)',
+    'gemini-2.5-pro': '🔬 3.1 Pro (Расширенные возможности)',
+    'gemini-2.0-pro-exp-02-05': '🧠 4 Argon (Сложные задачи)',
 }
 
 FALLBACK_ORDER = [
     'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
     'gemini-2.5-pro',
-    'gemini-2.0-flash',
-    'gemini-1.5-flash',
+    'gemini-2.0-pro-exp-02-05',
 ]
 
 user_models = {}
@@ -72,10 +74,10 @@ def get_user_model(chat_id):
 
 # ----------------- ХРАНИЛИЩЕ КОНТЕКСТА (ПАМЯТЬ) -----------------
 user_context = {}
-MAX_HISTORY = 10  # Хранить последние 10 сообщений (5 запросов и 5 ответов)
+MAX_HISTORY = 10  # Хранить последние 10 сообщений диалога
 
 def add_to_context(chat_id, role, text):
-    """Добавляет реплику пользователя или модели в память"""
+    """Добавляет сообщение пользователя или ассистента в историю"""
     if chat_id not in user_context:
         user_context[chat_id] = []
     
@@ -84,7 +86,7 @@ def add_to_context(chat_id, role, text):
         user_context[chat_id] = user_context[chat_id][-MAX_HISTORY:]
 
 def get_context_as_prompt(chat_id):
-    """Преобразует историю переписки в диалог"""
+    """Преобразует историю переписки в диалоговый текст"""
     if chat_id not in user_context or not user_context[chat_id]:
         return ""
     
@@ -95,15 +97,24 @@ def get_context_as_prompt(chat_id):
     return "\n".join(formatted)
 
 def clear_context(chat_id):
-    """Очищает историю диалога"""
+    """Очищает память беседы"""
     user_context[chat_id] = []
 
-# ----------------- КЛАВИАТУРЫ И ИНТЕРФЕЙС -----------------
+# ----------------- КЛАВИАТУРЫ И МЕНЮ -----------------
 
 def get_main_keyboard(chat_id):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     current_model_key = get_user_model(chat_id)
-    model_name_short = current_model_key.replace("gemini-", "").replace("-", " ").title() if current_model_key != 'auto' else 'Авто'
+    
+    # Короткое название для кнопки
+    short_names = {
+        'auto': 'Авто',
+        'gemini-2.5-flash-lite': '3.5 Flash-Lite',
+        'gemini-2.5-flash': '3.8 Flash',
+        'gemini-2.5-pro': '3.1 Pro',
+        'gemini-2.0-pro-exp-02-05': '4 Argon',
+    }
+    model_name_short = short_names.get(current_model_key, '3.8 Flash')
     
     btn_model = KeyboardButton(f"📝 Модель: {model_name_short}")
     btn_new = KeyboardButton("🔄 Новый диалог")
@@ -143,27 +154,29 @@ def get_model_inline_keyboard(current_model):
     markup.add(InlineKeyboardButton("⬅️ Назад в настройки", callback_data="back_to_settings"))
     return markup
 
-# ----------------- ЛОГИКА GEMINI -----------------
+# ----------------- ВЗАИМОДЕЙСТВИЕ С GEMINI API -----------------
 
 def call_single_model_http(model, parts, system_text):
     model_timeout = MODEL_TIMEOUTS.get(model, 60)
     url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}'
 
-    system_instruction = {'parts': [{'text': system_text}]}
     payload = {
-        'contents': [{'parts': parts}],
-        'system_instruction': system_instruction,
+        'contents': [{'role': 'user', 'parts': parts}],
+        'system_instruction': {'parts': [{'text': system_text}]},
         'generationConfig': {'maxOutputTokens': 4096},
     }
 
     resp = requests.post(url, json=payload, timeout=(10, model_timeout))
     if resp.status_code == 200:
         data = resp.json()
-        candidate_parts = data['candidates'][0]['content']['parts']
-        texts = [p['text'] for p in candidate_parts if 'text' in p]
-        reply_text = '\n'.join(texts).strip()
-        if reply_text:
-            return reply_text
+        candidates = data.get('candidates', [])
+        if candidates and 'content' in candidates[0]:
+            candidate_parts = candidates[0]['content'].get('parts', [])
+            texts = [p['text'] for p in candidate_parts if 'text' in p]
+            reply_text = '\n'.join(texts).strip()
+            if reply_text:
+                return reply_text
+    
     raise Exception(f'Код {resp.status_code}: {resp.text}')
 
 def ask_gemini_smart(chat_id, parts, system_text):
@@ -274,7 +287,7 @@ def handle_model_selection(call):
 def handle_text(message):
     text_lower = message.text.lower()
     
-    # Реакция на основные кнопки клавиатуры
+    # Кнопки клавиатуры
     if message.text == '⚙️ Настройки':
         send_settings_menu(message.chat.id)
         return
@@ -353,10 +366,10 @@ def handle_text(message):
             os.remove(file_name)
 
         else:
-            # Запоминаем вопрос пользователя
+            # 1. Запоминаем вопрос пользователя
             add_to_context(message.chat.id, "user", message.text)
 
-            # Формируем запрос с учетом памяти
+            # 2. Формируем запрос с учетом памяти
             history_str = get_context_as_prompt(message.chat.id)
             full_prompt = (
                 "Ты умный и полезный ассистент BananGPT. "
@@ -370,7 +383,7 @@ def handle_text(message):
 
             reply_text = ask_gemini_smart(message.chat.id, [{'text': full_prompt}], "Отвечай строго по сути, соблюдая контекст беседы.")
             
-            # Сохраняем ответ в память
+            # 3. Сохраняем ответ модели в контекст
             add_to_context(message.chat.id, "model", reply_text)
 
             bot.delete_message(message.chat.id, wait_msg.message_id)
