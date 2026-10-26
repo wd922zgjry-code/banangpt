@@ -4,6 +4,8 @@ import mimetypes
 import os
 import re
 import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 import matplotlib
 matplotlib.use('Agg')  # Для работы без графического интерфейса
 import matplotlib.pyplot as plt
@@ -16,6 +18,20 @@ from telebot.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
+
+# Фоновый мини-сервер, чтобы Render не ругался на отсутствие портов
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_dummy_server, daemon=True).start()
 
 # Безопасное чтение ключей (GitHub не будет блокировать)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
