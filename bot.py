@@ -44,11 +44,12 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 # Реальные рабочие модели Google API и их таймауты
+# Реальные рабочие модели Google API и их таймауты
 MODEL_TIMEOUTS = {
     'gemini-2.5-flash-lite': 20,
     'gemini-2.5-flash': 40,
+    'gemini-2.0-flash': 40,
     'gemini-2.5-pro': 120,
-    'gemini-2.0-pro-exp-02-05': 180,
 }
 
 # Пользовательские названия для меню (в точности по вашему списку)
@@ -56,15 +57,15 @@ MODEL_INFO = {
     'auto': '🔄 Авто (Умный перебор)',
     'gemini-2.5-flash-lite': '🚀 3.5 Flash-Lite (Самые быстрые ответы)',
     'gemini-2.5-flash': '⚡ 3.8 Flash (All-around help)',
-    'gemini-2.5-pro': '🔬 3.1 Pro (Расширенные возможности)',
-    'gemini-2.0-pro-exp-02-05': '🧠 4 Argon (Сложные задачи)',
+    'gemini-2.0-flash': '🔬 3.1 Pro (Расширенные возможности)',
+    'gemini-2.5-pro': '🧠 4 Argon (Сложные задачи)',
 }
 
 FALLBACK_ORDER = [
     'gemini-2.5-flash',
+    'gemini-2.0-flash',
     'gemini-2.5-flash-lite',
     'gemini-2.5-pro',
-    'gemini-2.0-pro-exp-02-05',
 ]
 
 user_models = {}
@@ -111,8 +112,8 @@ def get_main_keyboard(chat_id):
         'auto': 'Авто',
         'gemini-2.5-flash-lite': '3.5 Flash-Lite',
         'gemini-2.5-flash': '3.8 Flash',
-        'gemini-2.5-pro': '3.1 Pro',
-        'gemini-2.0-pro-exp-02-05': '4 Argon',
+        'gemini-2.0-flash': '3.1 Pro',
+        'gemini-2.5-pro': '4 Argon',
     }
     model_name_short = short_names.get(current_model_key, '3.8 Flash')
     
