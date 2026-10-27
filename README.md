@@ -18,7 +18,9 @@ Telegram-бот поверх личного веб-аккаунта Gemini (ку
 | `ALLOWED_IDS` | **да** | твой Telegram ID (несколько — через запятую). Пусто = бот никому не отвечает. ID покажет `/myid` |
 | `GEMINI_COOKIE_PATH` | нет | папка для обновляемых кук, например `/tmp/gemini_webapi` |
 | `KEEPALIVE_URL` | нет | публичный URL сервиса (на Render подставляется сам из `RENDER_EXTERNAL_URL`) |
-| `BOT_THREADS`, `REQUEST_TIMEOUT`, `LOG_LEVEL` | нет | потоки (8), таймаут Gemini в с (150), уровень логов |
+| `DEFAULT_MODEL` | нет | модель по умолчанию (`flash`, `pro`…); пусто = «авто» |
+| `MODEL_TIMEOUT` | нет | через сколько секунд молчащая выбранная модель заменяется режимом «авто» (60) |
+| `BOT_THREADS`, `REQUEST_TIMEOUT`, `LOG_LEVEL` | нет | потоки (8), общий таймаут Gemini в с (150), уровень логов |
 
 ## Render
 1. **Python 3.11+** (требование gemini-webapi): переменная `PYTHON_VERSION` = полная версия, например `3.12.3`.

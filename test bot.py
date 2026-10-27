@@ -27,6 +27,7 @@ class FakeState:
     valid_models = ["gemini-flash", "gemini-pro"]
     list_models_result = "default"
     strict_model = True
+    hang_models = set()
     calls = []
     inits = 0
 
@@ -60,6 +61,8 @@ class FakeClient:
 
     async def generate_content(self, prompt, model=None, files=None, **kw):
         FakeState.calls.append(SimpleNamespace(prompt=prompt, model=model, files=files))
+        if model in FakeState.hang_models:
+            await asyncio.sleep(60)
         if model and FakeState.strict_model and model not in FakeState.valid_models:
             raise ValueError("unknown model %s" % model)
         r = FakeState.reply(prompt, model, files) if callable(FakeState.reply) else FakeState.reply
@@ -283,6 +286,8 @@ class BotFlow(unittest.TestCase):
         FakeState.reply, FakeState.calls, FakeState.inits = "ok", [], 0
         FakeState.valid_models = ["gemini-flash", "gemini-pro"]
         FakeState.list_models_result, FakeState.strict_model = "default", True
+        FakeState.hang_models = set()
+        B.MODEL_TIMEOUT, B.DEFAULT_MODEL = 60, ""
 
     def names(self, kind):
         return [c for c in B.bot.calls if c.name == kind]
@@ -339,7 +344,7 @@ class BotFlow(unittest.TestCase):
     # ── модели ──
     def test_model_switch_validated_against_account(self):
         B.ensure_client_sync()
-        self.assertEqual(B.default_model(), "gemini-flash")
+        self.assertIsNone(B.default_model())
         B.cmd_model(msg("/model pro"))
         self.assertEqual(B.user_selected_model[42], "gemini-pro")
         B.cmd_model(msg("/model lite"))
@@ -359,6 +364,26 @@ class BotFlow(unittest.TestCase):
         B.handle_callbacks(SimpleNamespace(id="c", data="set_model_flash", message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=5)))
         B.handle_callbacks(SimpleNamespace(id="c", data="set_model_auto", message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=5)))
         self.assertIsNone(B.get_user_model(42))
+
+    def test_hanging_model_falls_back_to_auto(self):
+        B.ensure_client_sync()
+        B.user_selected_model[42] = "gemini-pro"
+        FakeState.hang_models = {"gemini-pro"}
+        B.MODEL_TIMEOUT = 1
+        FakeState.reply = "ответ от авто"
+        B.handle_text(msg("вопрос"))
+        self.assertEqual([c.model for c in FakeState.calls], ["gemini-pro", None])
+        texts = sent_texts()
+        self.assertIn("ответ от авто", texts)
+        self.assertTrue(any("не ответила" in t for t in texts), texts)
+        self.assertNotIn(42, B._busy)
+
+    def test_default_model_env_override(self):
+        B.ensure_client_sync()
+        B.DEFAULT_MODEL = "flash"
+        self.assertEqual(B.default_model(), "gemini-flash")
+        B.DEFAULT_MODEL = "auto"
+        self.assertIsNone(B.default_model())
 
     def test_selected_model_is_sent_to_gemini(self):
         B.ensure_client_sync()

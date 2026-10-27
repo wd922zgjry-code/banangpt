@@ -51,6 +51,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 SECURE_1PSID = os.getenv("GEMINI_SECURE_1PSID", "").strip()
 SECURE_1PSIDTS = os.getenv("GEMINI_SECURE_1PSIDTS", "").strip() or None
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "150"))
+# Если выбранная модель молчит дольше этого — бот сам повторяет запрос в режиме «авто»
+MODEL_TIMEOUT = int(os.getenv("MODEL_TIMEOUT", "60"))
+# Модель по умолчанию для новых чатов: пусто/auto = «авто» (самый быстрый и надёжный режим на этом аккаунте)
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "").strip()
 BOT_THREADS = int(os.getenv("BOT_THREADS", "8"))
 
 if not TELEGRAM_TOKEN:
@@ -200,11 +204,10 @@ def model_known(name):
 
 
 def default_model():
-    """Первый доступный пресет; если список моделей неизвестен — модель по умолчанию у Google (None)."""
-    if _account_names is not None:
-        for _key, _label, _emo, name in MODEL_PRESETS:
-            if _norm(name) in _account_names:
-                return name
+    """По умолчанию — «авто» (модель не передаётся). Можно задать переменной DEFAULT_MODEL, например gemini-flash."""
+    if DEFAULT_MODEL and DEFAULT_MODEL.lower() not in ("auto", "авто"):
+        name, _ = resolve_model_choice(DEFAULT_MODEL)
+        return name
     return None
 
 
@@ -300,16 +303,29 @@ async def _ask_async(prompt, file_path, prefix, model):
     return GeminiReply(text=response.text or "", images=saved, notice=notice)
 
 
+def _run_gemini(prompt, file_path, prefix, model, timeout):
+    fut = asyncio.run_coroutine_threadsafe(_ask_async(prompt, file_path, prefix, model), bot_loop)
+    try:
+        return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        fut.cancel()
+        log.error("Таймаут %d с: Gemini не ответил (модель=%s)", timeout, model or "авто")
+        raise TimeoutError("Gemini не ответил за %d с" % timeout)
+
+
 def ask_gemini_sync(prompt, file_path=None, prefix="0", chat_id=None):
     _ensure_loop()
     model = get_user_model(chat_id) if chat_id is not None else default_model()
-    fut = asyncio.run_coroutine_threadsafe(_ask_async(prompt, file_path, prefix, model), bot_loop)
+    if not model:
+        return _run_gemini(prompt, file_path, prefix, None, REQUEST_TIMEOUT)
     try:
-        return fut.result(timeout=REQUEST_TIMEOUT)
-    except concurrent.futures.TimeoutError:
-        fut.cancel()
-        log.error("Таймаут %d с: Gemini не ответил (модель=%s). Смотри строки выше.", REQUEST_TIMEOUT, model or "авто")
-        raise TimeoutError("Gemini не ответил за %d с" % REQUEST_TIMEOUT)
+        return _run_gemini(prompt, file_path, prefix, model, MODEL_TIMEOUT)
+    except TimeoutError:
+        log.warning("Модель %s молчит — повторяю запрос в режиме «авто»", model)
+        reply = _run_gemini(prompt, file_path, prefix + "_auto", None, REQUEST_TIMEOUT)
+        note = "⚠️ Модель «%s» не ответила за %d с — ответил режим «авто»." % (get_user_model_short_name(chat_id), MODEL_TIMEOUT)
+        reply.notice = note + ("\n" + reply.notice if reply.notice else "")
+        return reply
 
 
 def ensure_client_sync(timeout=90):
