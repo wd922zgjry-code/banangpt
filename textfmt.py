@@ -196,6 +196,20 @@ def clean_formatting(text):
     return "".join(out).strip()
 
 
+def split_blocks(text):
+    """Для PDF/DOCX: [("text", очищенный текст) | ("code", код как есть)]."""
+    blocks = []
+    for chunk in _FENCE_RE.split(text or ""):
+        m = _FENCE_BODY_RE.match(chunk) if chunk.startswith("```") else None
+        if m:
+            blocks.append(("code", m.group(1)))
+        else:
+            cleaned = _clean_text_part(chunk).strip()
+            if cleaned:
+                blocks.append(("text", cleaned))
+    return blocks
+
+
 # ───────────────────────── служебные метки и графики ─────────────────────────
 
 _PY_FENCE_RE = re.compile(r"```[ \t]*(?:python|py)?[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
