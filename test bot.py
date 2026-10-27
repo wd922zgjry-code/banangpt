@@ -24,7 +24,7 @@ PNG = b"\x89PNG\r\n\x1a\n"
 # ───────────── заглушка Gemini ─────────────
 class FakeState:
     reply = "ok"                # str | callable(prompt, model, files) -> str | (str, n_images)
-    valid_models = ["gemini-3.5-flash", "gemini-3.1-pro"]
+    valid_models = ["gemini-flash", "gemini-pro"]
     list_models_result = "default"
     strict_model = True
     calls = []
@@ -281,7 +281,7 @@ class BotFlow(unittest.TestCase):
         B._busy.clear()
         B.ALLOWED_IDS = {42}
         FakeState.reply, FakeState.calls, FakeState.inits = "ok", [], 0
-        FakeState.valid_models = ["gemini-3.5-flash", "gemini-3.1-pro"]
+        FakeState.valid_models = ["gemini-flash", "gemini-pro"]
         FakeState.list_models_result, FakeState.strict_model = "default", True
 
     def names(self, kind):
@@ -330,37 +330,37 @@ class BotFlow(unittest.TestCase):
         self.assertIn("(пусто)", p1)
 
     def test_new_dialog_keeps_model(self):
-        B.user_selected_model[42] = "gemini-3.1-pro"
+        B.user_selected_model[42] = "gemini-pro"
         B.add_to_context(42, "user", "x")
         B.handle_text(msg("🔄 Новый диалог"))
         self.assertEqual(B.get_context_as_prompt(42), "")
-        self.assertEqual(B.user_selected_model[42], "gemini-3.1-pro")
+        self.assertEqual(B.user_selected_model[42], "gemini-pro")
 
     # ── модели ──
     def test_model_switch_validated_against_account(self):
         B.ensure_client_sync()
-        self.assertEqual(B.default_model(), "gemini-3.5-flash")
+        self.assertEqual(B.default_model(), "gemini-flash")
         B.cmd_model(msg("/model pro"))
-        self.assertEqual(B.user_selected_model[42], "gemini-3.1-pro")
-        B.cmd_model(msg("/model argon"))
+        self.assertEqual(B.user_selected_model[42], "gemini-pro")
+        B.cmd_model(msg("/model lite"))
         self.assertIn("нет на твоём аккаунте", sent_texts()[-1])
-        self.assertEqual(B.user_selected_model[42], "gemini-3.1-pro")
-        B.handle_callbacks(SimpleNamespace(id="c", data="set_model_argon", message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=5)))
+        self.assertEqual(B.user_selected_model[42], "gemini-pro")
+        B.handle_callbacks(SimpleNamespace(id="c", data="set_model_lite", message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=5)))
         self.assertTrue(self.names("answer_callback_query")[-1].kw.get("show_alert"))
         B.handle_callbacks(SimpleNamespace(id="c", data="set_model_3.5", message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=5)))
-        self.assertEqual(B.user_selected_model[42], "gemini-3.5-flash")
+        self.assertEqual(B.user_selected_model[42], "gemini-flash")
 
     def test_selected_model_is_sent_to_gemini(self):
         B.ensure_client_sync()
         B.cmd_model(msg("/model pro"))
         B.handle_text(msg("вопрос"))
-        self.assertEqual(FakeState.calls[-1].model, "gemini-3.1-pro")
+        self.assertEqual(FakeState.calls[-1].model, "gemini-pro")
 
     def test_unknown_model_falls_back_with_notice(self):
         FakeState.list_models_result = []  # список моделей неизвестен
-        B.user_selected_model[42] = "gemini-4-argon"
+        B.user_selected_model[42] = "gemini-argon"
         B.handle_text(msg("вопрос"))
-        self.assertEqual([c.model for c in FakeState.calls], ["gemini-4-argon", None])
+        self.assertEqual([c.model for c in FakeState.calls], ["gemini-argon", None])
         texts = sent_texts()
         self.assertTrue(any("недоступна" in t for t in texts), texts)
 

@@ -148,14 +148,17 @@ class GeminiNotConfigured(RuntimeError):
 
 
 # Пресеты: ключ для /model, подпись на кнопке, эмодзи, имя модели у Gemini.
+# Имена взяты из реального списка аккаунта (лог «Модели аккаунта»).
 MODEL_PRESETS = [
-    ("argon", "4 Argon", "⚡", "gemini-4-argon"),
-    ("3.8", "3.8 Flash", "🚀", "gemini-3.8-flash"),
-    ("3.5", "3.5 Flash", "💡", "gemini-3.5-flash"),
-    ("lite", "3.5 Lite", "🪶", "gemini-3.5-flash-lite"),
-    ("pro", "3.1 Pro", "🧠", "gemini-3.1-pro"),
+    ("argon", "4 Argon", "⚡", "gemini-argon"),
+    ("flash", "Flash", "🚀", "gemini-flash"),
+    ("lite", "Flash Lite", "🪶", "gemini-flash-lite"),
+    ("pro", "Pro", "🧠", "gemini-pro"),
 ]
 AVAILABLE_MODELS = {key: name for key, _label, _emo, name in MODEL_PRESETS}
+# старые ключи из прежней версии бота продолжают работать
+AVAILABLE_MODELS.update({"3.8": "gemini-flash", "3.5": "gemini-flash", "3.1": "gemini-pro"})
+PRESET_KEYS = [p[0] for p in MODEL_PRESETS]
 _SHORT_NAMES = {name: label for _key, label, _emo, name in MODEL_PRESETS}
 
 user_selected_model = {}
@@ -663,7 +666,7 @@ HELP_TEXT = (
     "• «сделай файл …» / «отправь файлом» — пришлю ответ файлом.\n"
     "• Графики и эпюры строю сам, если они нужны по задаче.\n\n"
     "Команды:\n"
-    "/model — выбор модели (/model 3.5, /model pro, /model argon)\n"
+    "/model — выбор модели (/model pro, /model flash, /model argon)\n"
     "/models — какие модели доступны на твоём аккаунте\n"
     "/new — очистить контекст\n"
     "/status — состояние бота\n"
@@ -723,7 +726,7 @@ def cmd_model(message):
         return
     name, asked = resolve_model_choice(parts[1])
     if name is None:
-        keys = ", ".join(AVAILABLE_MODELS)
+        keys = ", ".join(PRESET_KEYS)
         safe_reply(message, "⚠️ Модели «%s» нет на твоём аккаунте. Ключи: %s. Весь список: /models" % (asked, keys))
         return
     user_selected_model[chat_id] = name
