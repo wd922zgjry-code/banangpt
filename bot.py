@@ -277,6 +277,8 @@ async def _generate(client, prompt, files, model):
 async def _ask_async(prompt, file_path, prefix, model):
     client = await _get_client()
     files = [file_path] if (file_path and os.path.exists(file_path)) else None
+    t0 = time.time()
+    log.info("→ Gemini: модель=%s, файлов=%d, промпт %d симв.", model or "авто", len(files or []), len(prompt))
     try:
         response, notice = await _generate(client, prompt, files, model)
     except Exception as first_err:
@@ -294,6 +296,7 @@ async def _ask_async(prompt, file_path, prefix, model):
                 saved.append(str(path))
         except Exception as e:
             log.warning("Не удалось сохранить картинку %d: %s", idx, e)
+    log.info("← Gemini ответил за %.1f с (текст %d симв., картинок %d)", time.time() - t0, len(response.text or ""), len(saved))
     return GeminiReply(text=response.text or "", images=saved, notice=notice)
 
 
@@ -305,6 +308,7 @@ def ask_gemini_sync(prompt, file_path=None, prefix="0", chat_id=None):
         return fut.result(timeout=REQUEST_TIMEOUT)
     except concurrent.futures.TimeoutError:
         fut.cancel()
+        log.error("Таймаут %d с: Gemini не ответил (модель=%s). Смотри строки выше.", REQUEST_TIMEOUT, model or "авто")
         raise TimeoutError("Gemini не ответил за %d с" % REQUEST_TIMEOUT)
 
 
@@ -456,6 +460,7 @@ def send_model_selection_menu(chat_id):
             mark = emo + " "
         buttons.append(InlineKeyboardButton(mark + label, callback_data="set_model_" + key))
     markup.add(*buttons)
+    markup.add(InlineKeyboardButton(("✅ " if current is None else "🤖 ") + "Авто (модель аккаунта по умолчанию)", callback_data="set_model_auto"))
     markup.add(InlineKeyboardButton("⬅️ Назад в настройки", callback_data="back_to_settings"))
     bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
 
@@ -666,10 +671,11 @@ HELP_TEXT = (
     "• «сделай файл …» / «отправь файлом» — пришлю ответ файлом.\n"
     "• Графики и эпюры строю сам, если они нужны по задаче.\n\n"
     "Команды:\n"
-    "/model — выбор модели (/model pro, /model flash, /model argon)\n"
+    "/model — выбор модели (/model pro, /model flash, /model argon, /model auto)\n"
     "/models — какие модели доступны на твоём аккаунте\n"
     "/new — очистить контекст\n"
     "/status — состояние бота\n"
+    "/ping — проверка связи с Gemini\n"
     "/myid — твой Telegram ID" % MAX_HISTORY
 )
 
@@ -724,6 +730,10 @@ def cmd_model(message):
     if len(parts) < 2:
         send_model_selection_menu(chat_id)
         return
+    if parts[1].strip().lower() in ("auto", "авто", "default"):
+        user_selected_model[chat_id] = None
+        safe_reply(message, "✅ Модель: авто (Google выбирает по умолчанию для аккаунта)")
+        return
     name, asked = resolve_model_choice(parts[1])
     if name is None:
         keys = ", ".join(PRESET_KEYS)
@@ -731,6 +741,27 @@ def cmd_model(message):
         return
     user_selected_model[chat_id] = name
     bot.reply_to(message, "✅ Активная модель: `%s`" % name, parse_mode="Markdown", reply_markup=get_main_keyboard(chat_id))
+
+
+@bot.message_handler(commands=["ping"])
+def cmd_ping(message):
+    """Диагностика: минимальный запрос к Gemini без правил и контекста, с показом реальной ошибки."""
+    chat_id = message.chat.id
+    with busy_guard(chat_id) as free:
+        if not free:
+            safe_reply(message, "⏳ Ещё обрабатываю предыдущий запрос — подожди секунду.")
+            return
+        safe_reply(message, "🏓 Проверяю Gemini (модель: %s)..." % get_user_model_short_name(chat_id))
+        t0 = time.time()
+        try:
+            reply = ask_gemini_sync("Ответь одним словом: ок", prefix="ping_%s" % chat_id, chat_id=chat_id)
+            out = "✅ Gemini ответил за %.1f с: %s" % (time.time() - t0, (reply.text or "")[:100])
+            if reply.notice:
+                out += "\n" + reply.notice
+        except Exception as e:
+            log.exception("ping")
+            out = "❌ %s через %.1f с: %s" % (type(e).__name__, time.time() - t0, str(e)[:300])
+        safe_reply(message, out, quote=False)
 
 
 @bot.message_handler(commands=["status"])
@@ -790,6 +821,12 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id)
     elif data.startswith("set_model_"):
         key = data[len("set_model_"):]
+        if key == "auto":
+            user_selected_model[chat_id] = None
+            bot.answer_callback_query(call.id, "Модель: авто")
+            _try_delete(chat_id, call.message.message_id)
+            bot.send_message(chat_id, "✅ Модель: авто (по умолчанию аккаунта)", reply_markup=get_main_keyboard(chat_id))
+            return
         if key not in AVAILABLE_MODELS:
             bot.answer_callback_query(call.id, "Неизвестная модель", show_alert=True)
             return
@@ -958,6 +995,7 @@ def main():
             telebot.types.BotCommand("models", "Модели аккаунта"),
             telebot.types.BotCommand("new", "Новый диалог"),
             telebot.types.BotCommand("status", "Состояние бота"),
+            telebot.types.BotCommand("ping", "Проверка связи с Gemini"),
             telebot.types.BotCommand("help", "Помощь"),
             telebot.types.BotCommand("myid", "Мой Telegram ID"),
         ])

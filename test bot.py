@@ -350,6 +350,16 @@ class BotFlow(unittest.TestCase):
         B.handle_callbacks(SimpleNamespace(id="c", data="set_model_3.5", message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=5)))
         self.assertEqual(B.user_selected_model[42], "gemini-flash")
 
+    def test_auto_model_sends_no_model(self):
+        B.ensure_client_sync()
+        B.cmd_model(msg("/model auto"))
+        self.assertIsNone(B.user_selected_model[42])
+        B.handle_text(msg("вопрос"))
+        self.assertIsNone(FakeState.calls[-1].model)
+        B.handle_callbacks(SimpleNamespace(id="c", data="set_model_flash", message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=5)))
+        B.handle_callbacks(SimpleNamespace(id="c", data="set_model_auto", message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=5)))
+        self.assertIsNone(B.get_user_model(42))
+
     def test_selected_model_is_sent_to_gemini(self):
         B.ensure_client_sync()
         B.cmd_model(msg("/model pro"))
@@ -441,6 +451,19 @@ class BotFlow(unittest.TestCase):
         B.handle_files(msg(None, document=SimpleNamespace(file_id="d", file_name="a.pdf", file_size=50 * 1024 * 1024)))
         self.assertEqual(FakeState.calls, [])
         self.assertIn("20 МБ", sent_texts()[0])
+
+    # ── диагностика ──
+    def test_ping_ok_and_error(self):
+        FakeState.reply = "ок"
+        B.cmd_ping(msg("/ping"))
+        self.assertTrue(any(t.startswith("✅ Gemini ответил") for t in sent_texts()))
+        FakeState.reply = lambda *a: (_ for _ in ()).throw(RuntimeError("quota exceeded"))
+        B.bot.calls.clear()
+        B.cmd_ping(msg("/ping"))
+        out = " ".join(sent_texts())
+        self.assertIn("RuntimeError", out)
+        self.assertIn("quota exceeded", out)
+        self.assertNotIn(42, B._busy)
 
     # ── нагрузка ──
     def test_second_request_rejected_while_busy(self):
