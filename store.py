@@ -11,6 +11,7 @@ import queue
 import sqlite3
 import ssl
 import threading
+import time
 from urllib.parse import parse_qs, unquote, urlparse
 
 log = logging.getLogger("banan.store")
@@ -126,8 +127,15 @@ class Store:
                 self._worker.start()
         self._q.put((fn, args))
 
-    def flush(self):
-        self._q.join()
+    def flush(self, timeout=None):
+        """Ждёт, пока запишется всё из очереди (не дольше timeout секунд, если задан)."""
+        if timeout is None:
+            self._q.join()
+            return True
+        end = time.time() + timeout
+        while self._q.unfinished_tasks and time.time() < end:
+            time.sleep(0.05)
+        return not self._q.unfinished_tasks
 
     # ── пользователи ──
     def load_users(self):

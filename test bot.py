@@ -35,6 +35,8 @@ class FakeState:
     strict_model = True
     hang_models = set()
     on_init = None
+    on_init_client = None
+    client_args = []
     calls = []
     inits = 0
 
@@ -54,11 +56,15 @@ class FakeModel:
 class FakeClient:
     def __init__(self, secure_1psid=None, secure_1psidts=None, proxy=None):  # как в новой gemini-webapi: proxy, а не proxies
         self.psid, self.psidts = secure_1psid, secure_1psidts
+        self.cookies = {"__Secure-1PSID": secure_1psid, "__Secure-1PSIDTS": secure_1psidts}
+        FakeState.client_args.append((secure_1psid, secure_1psidts))
 
     async def init(self, **kw):
         FakeState.inits += 1
         if FakeState.on_init:
             FakeState.on_init()
+        if FakeState.on_init_client:
+            FakeState.on_init_client(self)
 
     async def close(self):
         pass
@@ -358,6 +364,9 @@ class BotFlow(unittest.TestCase):
         FakeState.valid_models = ["gemini-flash", "gemini-pro"]
         FakeState.list_models_result, FakeState.strict_model = "default", True
         FakeState.hang_models, FakeState.on_init = set(), None
+        FakeState.on_init_client, FakeState.client_args = None, []
+        B.cookie_store.update(start=(None, None), used="env", last_saved=None, saved_at=0.0, via="", error="")
+        B.SECURE_1PSID, B.SECURE_1PSIDTS = "psid", "psidts"
         B.MODEL_TIMEOUT, B.DEFAULT_MODEL = 60, ""
 
     def add_user(self, uid, **kw):
@@ -719,6 +728,164 @@ class BotFlow(unittest.TestCase):
         B.cmd_user(msg("/user @petya", user=42))
         self.assertIn("Петя", last_panel_text())
         self.assertIn("adm_ban_43", [cb for _t, cb in last_buttons()])
+
+    # ── куки в базе ──
+    def restart(self):
+        """«Перезапуск контейнера»: память пуста, база та же."""
+        B.store.flush()
+        path = B.store.path
+        B._gemini_client = None
+        B.cookie_watch.update(unauth=False, ok=None, last_alert=0.0)
+        B.cookie_store.update(last_saved=None, saved_at=0.0, via="", error="")
+        B.store = Store(path=path)
+        B.registry = UserRegistry(B.store, {42}, 10, 3, 3)
+        B.init_state()
+
+    def test_cookie_encryption_roundtrip_and_tamper(self):
+        blob = B.encrypt_text("секрет g.a000abc")
+        self.assertNotIn("g.a000abc", blob)
+        self.assertEqual(B.decrypt_text(blob), "секрет g.a000abc")
+        self.assertNotEqual(B.encrypt_text("x"), B.encrypt_text("x"))      # nonce разный
+        self.assertIsNone(B.decrypt_text(blob, key=b"k" * 32))             # чужой ключ
+        broken = blob[:-4] + ("AAAA" if not blob.endswith("AAAA") else "BBBB")
+        self.assertIsNone(B.decrypt_text(broken))                          # подмена
+        self.assertIsNone(B.decrypt_text("мусор"))
+
+    def test_rotated_cookies_are_saved_and_used_after_restart(self):
+        B.ensure_client_sync()
+        self.assertEqual(FakeState.client_args[-1], ("psid", "psidts"))
+        B._gemini_client.cookies["__Secure-1PSIDTS"] = "ROTATED-TS-VALUE-1234567890"   # библиотека обновила куку
+        self.assertTrue(B.save_cookies_now("тест"))
+        self.assertFalse(B.save_cookies_now("тест"))                       # без изменений — второй записи нет
+        self.restart()
+        B.ensure_client_sync()
+        self.assertEqual(FakeState.client_args[-1], ("psid", "ROTATED-TS-VALUE-1234567890"))
+        self.assertEqual(B.cookie_store["used"], "база")
+        raw = B.store.get_kv("gemini_cookies")
+        self.assertNotIn("ROTATED", raw)                                   # в базе только шифртекст
+
+    def test_manual_env_change_beats_saved_cookies(self):
+        B.ensure_client_sync()
+        B._gemini_client.cookies["__Secure-1PSIDTS"] = "OLD-ROTATED-VALUE-1234567890"
+        B.save_cookies_now("тест")
+        B.SECURE_1PSIDTS = "FRESH-FROM-RENDER-ENV-123456"   # админ вставил новые куки в Render
+        self.restart()
+        B.ensure_client_sync()
+        self.assertEqual(FakeState.client_args[-1], ("psid", "FRESH-FROM-RENDER-ENV-123456"))
+        self.assertEqual(B.cookie_store["used"], "env")
+
+    def test_bad_saved_cookies_fall_back_to_env(self):
+        B.ensure_client_sync()
+        B._gemini_client.cookies["__Secure-1PSIDTS"] = "EXPIRED-ROTATED-VALUE-1234567"
+        B.save_cookies_now("тест")
+        FakeState.on_init_client = lambda c: B._cookie_sink("UNAUTHENTICATED") if c.psidts == "EXPIRED-ROTATED-VALUE-1234567" else None
+        self.restart()
+        B.ensure_client_sync()
+        self.assertEqual([a[1] for a in FakeState.client_args[-2:]], ["EXPIRED-ROTATED-VALUE-1234567", "psidts"])
+        self.assertEqual(B.cookie_store["used"], "env")
+        self.assertIs(B.cookie_watch["ok"], True)
+
+    def test_guest_mode_never_overwrites_saved_cookies(self):
+        B.ensure_client_sync()
+        B._gemini_client.cookies["__Secure-1PSIDTS"] = "GOOD-ROTATED-VALUE-1234567890"
+        B.save_cookies_now("тест")
+        B.cookie_watch["ok"] = False                                       # Google перестал принимать куки
+        B._gemini_client.cookies["__Secure-1PSIDTS"] = "GUEST-JUNK-VALUE-1234567890"
+        self.assertFalse(B.save_cookies_now("тест"))
+        self.restart()
+        self.assertEqual(B.load_saved_cookies()["psidts"], "GOOD-ROTATED-VALUE-1234567890")
+
+    def test_token_change_makes_saved_cookies_unreadable_but_bot_still_starts(self):
+        B.ensure_client_sync()
+        B._gemini_client.cookies["__Secure-1PSIDTS"] = "ROTATED-TS-VALUE-1234567890"
+        B.save_cookies_now("тест")
+        old = B.TELEGRAM_TOKEN
+        B.TELEGRAM_TOKEN = "999:other-token"
+        try:
+            self.restart()
+            self.assertIsNone(B.load_saved_cookies())
+            B.ensure_client_sync()
+            self.assertEqual(FakeState.client_args[-1], ("psid", "psidts"))
+        finally:
+            B.TELEGRAM_TOKEN = old
+
+    def test_cookie_key_env_override(self):
+        os.environ["COOKIE_KEY"] = "мой-ключ"
+        try:
+            blob = B.encrypt_text("abc")
+            os.environ["COOKIE_KEY"] = "другой"
+            self.assertIsNone(B.decrypt_text(blob))
+            os.environ["COOKIE_KEY"] = "мой-ключ"
+            self.assertEqual(B.decrypt_text(blob), "abc")
+        finally:
+            os.environ.pop("COOKIE_KEY", None)
+
+    def test_save_on_shutdown_and_no_db_is_safe(self):
+        B.ensure_client_sync()
+        B._gemini_client.cookies["__Secure-1PSIDTS"] = "SHUTDOWN-VALUE-1234567890123"
+        B._shutdown_save()
+        self.assertEqual(B.load_saved_cookies()["psidts"], "SHUTDOWN-VALUE-1234567890123")
+        calls = []
+        old_exit, B._exit = B._exit, calls.append
+        try:
+            B._on_sigterm(15, None)
+        finally:
+            B._exit = old_exit
+        self.assertEqual(calls, [0])
+        B.registry.store = None                                            # без базы ничего не падает
+        self.assertFalse(B.save_cookies_now("тест"))
+        self.assertIsNone(B.load_saved_cookies())
+        self.assertIn("выключено", B.cookie_store_text())
+
+    def test_cookie_readers_handle_different_jar_shapes(self):
+        class Morsel:
+            def __init__(self, n, v):
+                self.name, self.value = n, v
+
+        class ConflictJar:                 # как httpx.Cookies при дублях: get() бросает, но .jar читается
+            jar = [Morsel("__Secure-1PSIDTS", "old"), Morsel("__Secure-1PSIDTS", "newest")]
+
+            def get(self, name):
+                raise RuntimeError("CookieConflict")
+
+        self.assertEqual(B._read_cookie(SimpleNamespace(cookies=ConflictJar()), "__Secure-1PSIDTS"), "newest")
+        self.assertEqual(B._read_cookie(SimpleNamespace(cookies={"a": "1"}), "a"), "1")
+        self.assertIsNone(B._read_cookie(SimpleNamespace(), "a"))
+        self.assertIsNone(B._read_cookie(SimpleNamespace(cookies={}), "a"))
+
+    def test_cached_file_fallback(self):
+        d = tempfile.mkdtemp()
+        os.environ["GEMINI_COOKIE_PATH"] = d
+        try:
+            Path(d, ".cached_1psidts_psid.txt").write_text("CACHED-TS-VALUE-1234567890123")
+            self.assertEqual(B._read_cached_ts("psid"), "CACHED-TS-VALUE-1234567890123")
+            self.assertIsNone(B._read_cached_ts("another-account"))
+        finally:
+            os.environ.pop("GEMINI_COOKIE_PATH", None)
+        # клиент не отдаёт куку — берём из файла-кэша
+        B.ensure_client_sync()
+        B._gemini_client.cookies.pop("__Secure-1PSIDTS")
+        os.environ["GEMINI_COOKIE_PATH"] = d
+        try:
+            self.assertTrue(B.save_cookies_now("тест"))
+            self.assertEqual(B.cookie_store["via"], "файл-кэш библиотеки")
+        finally:
+            os.environ.pop("GEMINI_COOKIE_PATH", None)
+
+    def test_unreadable_cookies_reported_to_admin_not_crash(self):
+        B.ensure_client_sync()
+        B._gemini_client.cookies.clear()
+        self.assertFalse(B.save_cookies_now("тест"))
+        self.assertIn("не удалось прочитать", B.cookie_store_text())
+        click("adm_cookies")
+        self.assertIn("Автосохранение кук", last_panel_text())
+
+    def test_store_flush_with_timeout(self):
+        s = Store(path=os.path.join(tempfile.mkdtemp(), "f.db"))
+        s.init()
+        s.save_kv("a", "1")
+        self.assertTrue(s.flush(timeout=5))
+        self.assertEqual(s.get_kv("a"), "1")
 
     # ── режимы ──
     def test_mode_changes_prompt_and_is_saved(self):

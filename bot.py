@@ -7,13 +7,18 @@
 Весь ответ чистится от Markdown/LaTeX, знаки умножения сохраняются.
 """
 import asyncio
+import base64
 import concurrent.futures
+import hashlib
+import hmac
 import inspect
 import io
 import json
 import logging
 import os
 import re
+import secrets
+import signal
 import sys
 import tempfile
 import threading
@@ -222,6 +227,209 @@ def update_cookie_state(ok, detail=""):
         notify_admins_async("✅ Куки Gemini снова работают.")
 
 
+# ───────────────────────── куки Gemini в базе ─────────────────────────
+# gemini-webapi сам обновляет куки (1PSIDTS) в памяти, но при рестарте контейнера они теряются, а в Render лежит старая
+# копия. Поэтому бот сам кладёт свежие куки в базу (в зашифрованном виде) и при запуске берёт их оттуда.
+# Если ты вручную поменял куки в Render, бот это замечает (по отпечатку переменных) и берёт новые из Render.
+cookie_store = {"start": (None, None), "used": "env", "last_saved": None, "saved_at": 0.0, "via": "", "error": ""}
+_cookie_save_lock = threading.Lock()
+
+
+def _derive(key, label):
+    return hmac.new(key, label, hashlib.sha256).digest()
+
+
+def _cookie_key():
+    raw = os.getenv("COOKIE_KEY", "").strip() or TELEGRAM_TOKEN
+    return hashlib.sha256(("banan-cookie-key|" + raw).encode("utf-8")).digest()
+
+
+def _keystream(key, nonce, n):
+    out, i = b"", 0
+    while len(out) < n:
+        out += hmac.new(key, nonce + i.to_bytes(4, "big"), hashlib.sha256).digest()
+        i += 1
+    return out[:n]
+
+
+def encrypt_text(text, key=None):
+    """HMAC-CTR + HMAC-тег (шифрование с проверкой целостности) на одной стандартной библиотеке."""
+    key = key or _cookie_key()
+    enc_key, mac_key = _derive(key, b"enc"), _derive(key, b"mac")
+    nonce, data = secrets.token_bytes(16), text.encode("utf-8")
+    ct = bytes(a ^ b for a, b in zip(data, _keystream(enc_key, nonce, len(data))))
+    tag = hmac.new(mac_key, nonce + ct, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(nonce + tag + ct).decode("ascii")
+
+
+def decrypt_text(blob, key=None):
+    """Возвращает текст или None (чужой ключ, повреждённые данные)."""
+    try:
+        key = key or _cookie_key()
+        enc_key, mac_key = _derive(key, b"enc"), _derive(key, b"mac")
+        raw = base64.urlsafe_b64decode(blob.encode("ascii"))
+        nonce, tag, ct = raw[:16], raw[16:48], raw[48:]
+        if not hmac.compare_digest(tag, hmac.new(mac_key, nonce + ct, hashlib.sha256).digest()):
+            return None
+        return bytes(a ^ b for a, b in zip(ct, _keystream(enc_key, nonce, len(ct)))).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _env_fp():
+    """Отпечаток кук из переменных окружения: изменились — значит, админ обновил их вручную."""
+    return hashlib.sha256(("%s|%s" % (SECURE_1PSID, SECURE_1PSIDTS or "")).encode("utf-8")).hexdigest()[:16]
+
+
+def _read_cookie(client, name):
+    """Достаёт значение куки из клиента (httpx/curl_cffi/dict) — форма хранилища зависит от версии библиотеки."""
+    jar = getattr(client, "cookies", None)
+    if jar is None:
+        return None
+    try:
+        value = jar.get(name)
+        if value:
+            return value
+    except Exception:
+        pass  # httpx бросает CookieConflict, если одна кука есть для нескольких доменов
+    inner = getattr(jar, "jar", None)
+    if inner is not None:
+        try:
+            values = [c.value for c in inner if c.name == name and c.value]
+            if values:
+                return values[-1]
+        except Exception:
+            pass
+    return jar.get(name) if isinstance(jar, dict) else None
+
+
+def _read_cached_ts(psid):
+    """Запасной путь: файл-кэш 1PSIDTS, который библиотека пишет в GEMINI_COOKIE_PATH."""
+    dirs = [os.getenv("GEMINI_COOKIE_PATH", "")]
+    try:
+        import gemini_webapi
+        dirs.append(os.path.join(os.path.dirname(gemini_webapi.__file__), "temp"))
+    except Exception:
+        pass
+    dirs.append(os.path.join(tempfile.gettempdir(), "gemini_webapi"))
+    files = []
+    for d in filter(None, dirs):
+        try:  # glob пропускает файлы, начинающиеся с точки (.cached_1psidts_…), поэтому listdir
+            files += [os.path.join(d, n) for n in os.listdir(d) if "1psidts" in n.lower()]
+        except OSError:
+            pass
+    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    for f in files:
+        if psid and psid not in os.path.basename(f):
+            continue
+        try:
+            value = open(f, encoding="utf-8").read().strip()
+        except OSError:
+            continue
+        if len(value) > 20 and not re.search(r"\s", value):
+            return value
+    return None
+
+
+def load_saved_cookies():
+    """Сохранённые куки из базы или None. Старые (до ручной смены кук в Render) игнорируются."""
+    if registry.store is None:
+        return None
+    try:
+        blob = registry.store.get_kv("gemini_cookies")
+    except Exception as e:
+        log.warning("Не удалось прочитать куки из базы: %s", e)
+        return None
+    if not blob:
+        return None
+    raw = decrypt_text(blob)
+    if raw is None:
+        log.warning("Сохранённые куки не расшифровались (сменился токен бота или COOKIE_KEY) — беру куки из Render")
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if data.get("env_fp") != _env_fp():
+        log.info("Куки в переменных Render изменились — сохранённые в базе не используются")
+        return None
+    if not data.get("psid") or not data.get("psidts"):
+        return None
+    return data
+
+
+def save_cookies_now(reason=""):
+    """Кладёт текущие куки живого клиента в базу, если они изменились. True — записано."""
+    if registry.store is None or _gemini_client is None or cookie_watch["ok"] is not True:
+        return False  # в гостевом режиме ничего не сохраняем, чтобы не затереть хорошие куки
+    with _cookie_save_lock:
+        psid = _read_cookie(_gemini_client, "__Secure-1PSID") or cookie_store["start"][0]
+        psidts, via = _read_cookie(_gemini_client, "__Secure-1PSIDTS"), "client.cookies"
+        if not psidts:
+            psidts, via = _read_cached_ts(psid), "файл-кэш библиотеки"
+        if not psid or not psidts:
+            if not cookie_store["error"]:
+                log.warning("Не смог прочитать обновлённые куки из клиента Gemini — автосохранение не работает")
+            cookie_store["error"] = "не удалось прочитать 1PSIDTS из клиента"
+            return False
+        if (psid, psidts) == cookie_store["last_saved"]:
+            return False
+        payload = json.dumps({"psid": psid, "psidts": psidts, "env_fp": _env_fp(), "saved_at": int(time.time())})
+        registry.store.save_kv("gemini_cookies", encrypt_text(payload))
+        cookie_store.update(last_saved=(psid, psidts), saved_at=time.time(), via=via, error="")
+        log.info("Куки Gemini сохранены в базу (%s; %s; PSIDTS …%s)", reason or "по таймеру", via, psidts[-6:])
+        return True
+
+
+def start_cookie_saver():
+    interval = int(os.getenv("COOKIE_SAVE_INTERVAL", "300"))
+    if interval <= 0:
+        return
+
+    def loop():
+        while True:
+            time.sleep(interval)
+            try:
+                save_cookies_now("по таймеру")
+            except Exception as e:
+                log.warning("Автосохранение кук: %s", e)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+_exit = os._exit
+
+
+def _shutdown_save():
+    try:
+        save_cookies_now("остановка")
+        if registry.store is not None:
+            registry.store.flush(timeout=10)
+    except Exception as e:
+        log.warning("Сохранение кук при остановке не удалось: %s", e)
+
+
+def _on_sigterm(signum, frame):
+    log.info("Получен сигнал остановки — сохраняю куки и выхожу")
+    _shutdown_save()
+    _exit(0)
+
+
+def cookie_store_text():
+    if registry.store is None:
+        return "Автосохранение кук: выключено (нет базы — задай DATABASE_URL)"
+    if cookie_store["error"]:
+        return "Автосохранение кук: ⚠️ %s" % cookie_store["error"]
+    if not cookie_store["saved_at"]:
+        return "Автосохранение кук: ещё ничего не сохранено\nПри запуске использованы куки из: %s" % cookie_store["used"]
+    return "Автосохранение кук: последнее — %s (%s)\nПри запуске использованы куки из: %s" % (
+        _ago(cookie_store["saved_at"]), cookie_store["via"], cookie_store["used"])
+
+
+def cookies_report():
+    return "%s\n%s" % (_cookie_text(), cookie_store_text())
+
+
 # ───────────────────────── Gemini (отдельный event loop) ─────────────────────────
 bot_loop = asyncio.new_event_loop()
 _loop_lock = threading.Lock()
@@ -335,25 +543,46 @@ def set_user_model(chat_id, value):
     registry.set_pref(chat_id, model="auto" if value is None else value)
 
 
+async def _init_client(psid, psidts):
+    # ВАЖНО: без proxies= — в новых gemini-webapi аргумент называется proxy (и он необязателен)
+    client = GeminiClient(psid, psidts)
+    cookie_watch["unauth"] = False
+    cookie_store["start"] = (psid, psidts)
+    await client.init(timeout=60, auto_close=False, auto_refresh=True)
+    return client
+
+
 async def _get_client(force=False):
     global _gemini_client
     async with _client_lock:
         if not SECURE_1PSID:
             raise GeminiNotConfigured("Не задана переменная GEMINI_SECURE_1PSID.")
         if _gemini_client is None or force:
+            loop = asyncio.get_running_loop()
             if _gemini_client is not None:
+                await loop.run_in_executor(None, save_cookies_now, "перед переподключением")
                 try:
                     await _gemini_client.close()
                 except Exception:
                     pass
                 _gemini_client = None
-            # ВАЖНО: без proxies= — в новых gemini-webapi аргумент называется proxy (и он необязателен)
-            client = GeminiClient(SECURE_1PSID, SECURE_1PSIDTS)
-            cookie_watch["unauth"] = False
-            await client.init(timeout=60, auto_close=False, auto_refresh=True)
+            saved = await loop.run_in_executor(None, load_saved_cookies)
+            source = "база" if saved else "env"
+            client = await _init_client(saved["psid"], saved["psidts"]) if saved else await _init_client(SECURE_1PSID, SECURE_1PSIDTS)
+            if saved and cookie_watch["unauth"]:
+                log.warning("Куки из базы не подошли — пробую куки из переменных Render")
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                client, source = await _init_client(SECURE_1PSID, SECURE_1PSIDTS), "env"
             _gemini_client = client
+            cookie_store["used"] = source
             await _discover_models(client)
-            update_cookie_state(not cookie_watch["unauth"])
+            ok = not cookie_watch["unauth"]
+            update_cookie_state(ok)
+            if ok:
+                await loop.run_in_executor(None, save_cookies_now, "после подключения")
         return _gemini_client
 
 
@@ -1366,7 +1595,7 @@ def cmd_cookies(message):
     except Exception as e:
         safe_reply(message, "❌ %s: %s" % (type(e).__name__, str(e)[:200]), quote=False)
         return
-    safe_reply(message, _cookie_text() + "\nМоделей на аккаунте: %d" % len(_account_list), quote=False)
+    safe_reply(message, cookies_report() + "\nМоделей на аккаунте: %d" % len(_account_list), quote=False)
 
 
 @bot.message_handler(commands=["broadcast"])
@@ -1610,7 +1839,7 @@ def handle_admin_callback(call):
             markup.add(InlineKeyboardButton("⬅️ В меню", callback_data="adm_menu"))
             try:
                 ensure_client_sync(force=True)
-                _show(call, "%s\nМоделей на аккаунте: %d" % (_cookie_text(), len(_account_list)), markup)
+                _show(call, "%s\nМоделей на аккаунте: %d" % (cookies_report(), len(_account_list)), markup)
             except Exception as e:
                 _show(call, "❌ %s: %s\n%s" % (type(e).__name__, str(e)[:200], _cookie_text()), markup)
             return
@@ -1973,6 +2202,11 @@ def main():
         log.info("Процесс защищён от чтения /proc/<pid>/environ дочерними процессами")
     init_state()
     install_cookie_watch()
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError) as e:
+        log.warning("SIGTERM-обработчик не установлен: %s", e)
+    start_cookie_saver()
     start_health_server()
     start_keepalive()
     if not ADMIN_IDS:
