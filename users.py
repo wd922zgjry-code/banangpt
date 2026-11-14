@@ -94,16 +94,22 @@ class UserRegistry:
     def is_allowed(self, uid):
         return self.status(uid) in ("admin", STATUS_ACTIVE)
 
+    @staticmethod
+    def full_name(from_user):
+        parts = [getattr(from_user, "first_name", None), getattr(from_user, "last_name", None)]
+        return " ".join(p for p in parts if p) or None
+
     def touch(self, from_user):
-        """Обновляет имя/ник и время последней активности (для уже известных)."""
+        """Обновляет username/полное имя (в колонке first_name) и last_seen; пишет в БД."""
         uid = from_user.id
         with self.lock:
             u = self.users.get(uid)
             if u is None:
                 return None
-            u["username"] = getattr(from_user, "username", None) or u.get("username")
-            u["first_name"] = getattr(from_user, "first_name", None) or u.get("first_name")
+            u["username"] = getattr(from_user, "username", None)  # None — ник убрали, так и храним
+            u["first_name"] = self.full_name(from_user) or u.get("first_name")
             u["last_seen"] = int(time.time())
+            self._save(u)
             return u
 
     def register_pending(self, from_user):
@@ -115,7 +121,7 @@ class UserRegistry:
                 return u, False
             if sum(1 for x in self.users.values() if x["status"] == STATUS_PENDING) >= self.max_pending:
                 return None, False
-            u = self._new(uid, getattr(from_user, "username", None), getattr(from_user, "first_name", None), STATUS_PENDING)
+            u = self._new(uid, getattr(from_user, "username", None), self.full_name(from_user), STATUS_PENDING)
             self.users[uid] = u
             self._save(u)
             return u, True

@@ -11,6 +11,7 @@ import base64
 import concurrent.futures
 import hashlib
 import hmac
+import html
 import inspect
 import io
 import json
@@ -1446,7 +1447,7 @@ def cmd_user(message):
     if uid is None or uid not in registry.users:
         safe_reply(message, "Использование: /user <id|@ник> (пользователь должен быть в списке)")
         return
-    bot.send_message(message.chat.id, user_card(uid), reply_markup=user_card_markup(uid))
+    bot.send_message(message.chat.id, user_card(uid), parse_mode="HTML", reply_markup=user_card_markup(uid))
 
 
 @bot.message_handler(commands=["adduser"])
@@ -1697,9 +1698,12 @@ def user_card(uid):
     if not u:
         return "Пользователь не найден."
     limit, used = registry.limit_for(uid), registry.usage_today(uid)
-    lines = ["👤 %s" % _who(u), "ID: %d" % uid, "Статус: %s" % _status_label(uid)]
+    name = html.escape(u.get("first_name") or "без имени")
+    lines = ['👤 <a href="tg://user?id=%d">%s</a>' % (uid, name),
+             "Username: %s" % (("@" + html.escape(u["username"])) if u.get("username") else "нет username"),
+             "ID: %d" % uid, "Статус: %s" % _status_label(uid)]
     if u.get("note"):
-        lines.append("Причина: %s" % u["note"])
+        lines.append("Причина: %s" % html.escape(u["note"]))
     lines.append("В боте с: %s · был: %s" % (_fmt_dt(u["created_at"]) if u.get("created_at") else "—", _ago(u.get("last_seen"))))
     lines.append("Сегодня: %d/%s · всего запросов: %s" % (used, limit or "∞", u.get("total", 0)))
     lines.append("Модель: %s · режим: %s" % (get_user_model_short_name(uid), MODES[get_mode(uid)][0]))
@@ -1736,18 +1740,19 @@ def _duration_menu(uid, title, options, prefix):
     return "%s\n\n%s" % (title, user_card(uid)), markup
 
 
-def _show(call, text, markup=None):
+def _show(call, text, markup=None, html_mode=False):
     chat_id = call.message.chat.id
+    pm = "HTML" if html_mode else None
     try:
-        bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=markup)
+        bot.edit_message_text(text, chat_id, call.message.message_id, parse_mode=pm, reply_markup=markup)
     except Exception as e:
         if "not modified" in str(e):
             return
-        bot.send_message(chat_id, text, reply_markup=markup)
+        bot.send_message(chat_id, text, parse_mode=pm, reply_markup=markup)
 
 
 def _show_card(call, uid):
-    _show(call, user_card(uid), user_card_markup(uid))
+    _show(call, user_card(uid), user_card_markup(uid), html_mode=True)
 
 
 def handle_admin_callback(call):
@@ -1787,7 +1792,7 @@ def handle_admin_callback(call):
             return
         elif act == "ban":
             text, markup = _duration_menu(uid, "🚫 На сколько забанить?", BAN_OPTIONS, "bt")
-            _show(call, text, markup)
+            _show(call, text, markup, html_mode=True)
         elif act == "bt":
             seconds = int(arg or 0) or None
             ok, msg = registry.ban(uid, None, seconds)
@@ -1798,7 +1803,7 @@ def handle_admin_callback(call):
             return
         elif act == "mute":
             text, markup = _duration_menu(uid, "🔇 На сколько замутить?", MUTE_OPTIONS, "mt")
-            _show(call, text, markup)
+            _show(call, text, markup, html_mode=True)
         elif act == "mt":
             seconds = int(arg or 0) or None
             ok, msg = registry.mute(uid, seconds)
@@ -1813,7 +1818,7 @@ def handle_admin_callback(call):
             _show_card(call, uid)
         elif act == "lim":
             text, markup = _duration_menu(uid, "📊 Лимит запросов в день:", LIMIT_OPTIONS, "ls")
-            _show(call, text, markup)
+            _show(call, text, markup, html_mode=True)
         elif act == "ls":
             registry.set_limit(uid, None if arg == "d" else int(arg))
             _show_card(call, uid)
@@ -1821,7 +1826,7 @@ def handle_admin_callback(call):
             markup = InlineKeyboardMarkup(row_width=2)
             markup.add(InlineKeyboardButton("🗑 Да, удалить", callback_data="adm_delok_%d" % uid),
                        InlineKeyboardButton("⬅️ Нет", callback_data="adm_u_%d" % uid))
-            _show(call, "Удалить пользователя совсем (вместе с историей)?\n\n" + user_card(uid), markup)
+            _show(call, "Удалить пользователя совсем (вместе с историей)?\n\n" + user_card(uid), markup, html_mode=True)
         elif act == "delok":
             registry.remove(uid)
             text, markup = admin_list("all", 0)
