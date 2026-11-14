@@ -1450,6 +1450,37 @@ def cmd_user(message):
     bot.send_message(message.chat.id, user_card(uid), parse_mode="HTML", reply_markup=user_card_markup(uid))
 
 
+@bot.message_handler(commands=["msg"])
+def cmd_msg(message):
+    if not _is_admin_msg(message):
+        return
+    parts = (message.text or "").split(None, 2)
+    if len(parts) < 3:
+        safe_reply(message, "Использование: /msg <id|@ник> <текст>")
+        return
+    uid = _target(message)
+    if uid is None or uid not in registry.users:
+        safe_reply(message, "❌ Пользователь не найден в списке.")
+        return
+    try:
+        bot.send_message(uid, "✉️ Сообщение от админа:\n" + parts[2])
+    except telebot.apihelper.ApiTelegramException as e:
+        desc = str(e).lower()
+        if e.error_code == 403 or "blocked" in desc or "deactivated" in desc:
+            safe_reply(message, "🚫 Не доставлено: пользователь заблокировал бота или удалил аккаунт.")
+        elif e.error_code == 400 and "chat not found" in desc:
+            safe_reply(message, "❌ Чат не найден: пользователь ещё не писал боту.")
+        else:
+            log.warning("/msg %s: %s", uid, e)
+            safe_reply(message, "⚠️ Ошибка Telegram: %s" % str(e)[:200])
+        return
+    except Exception as e:
+        log.warning("/msg %s: %s", uid, e)
+        safe_reply(message, "⚠️ Не отправлено: %s" % type(e).__name__)
+        return
+    safe_reply(message, "✅ Отправлено (ID %d)." % uid)
+
+
 @bot.message_handler(commands=["adduser"])
 def cmd_adduser(message):
     if not _is_admin_msg(message):
@@ -1647,7 +1678,7 @@ def admin_menu_text():
     return (
         "👑 Админ-панель\n\nАктивных: %d/%d · в муте: %d · заявок: %d · в бане: %d\n\n"
         "Открой пользователя из списка — там кнопки: одобрить, мут, бан, лимит, написать, удалить.\n"
-        "Команды: /user, /mute, /unmute, /ban, /unban, /limit, /adduser, /removeuser, /stats, /cookies, /broadcast"
+        "Команды: /user, /msg, /mute, /unmute, /ban, /unban, /limit, /adduser, /removeuser, /stats, /cookies, /broadcast"
         % (registry.active_count(), MAX_USERS, muted, _count("pend"), _count("ban"))
     )
 
@@ -2189,7 +2220,7 @@ def _register_commands():
     ]
     admin_extra = [
         ("users", "Пользователи"), ("stats", "Статистика"), ("cookies", "Состояние кук"),
-        ("admin", "Команды админа"),
+        ("msg", "Написать пользователю"), ("admin", "Команды админа"),
     ]
     try:
         bot.set_my_commands([telebot.types.BotCommand(c, d) for c, d in common])
