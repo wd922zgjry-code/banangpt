@@ -141,6 +141,15 @@ for n in ("InlineKeyboardButton", "KeyboardButton"):
 tb.types.InlineKeyboardMarkup = tb.types.ReplyKeyboardMarkup = Markup
 tb.types.BotCommand = lambda *a: a
 tb.types.BotCommandScopeChat = lambda *a: a
+
+
+class FakeApiExc(Exception):
+    def __init__(self, code, desc):
+        super().__init__("Error code: %s. Description: %s" % (code, desc))
+        self.error_code = code
+
+
+tb.apihelper = SimpleNamespace(ApiTelegramException=FakeApiExc)
 sys.modules.update({"telebot": tb, "telebot.types": tb.types})
 gw = types.ModuleType("gemini_webapi")
 gw.GeminiClient = FakeClient
@@ -410,6 +419,39 @@ class BotFlow(unittest.TestCase):
                                            message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=9)))
         self.assertTrue(B.is_allowed(7))
         self.assertTrue(any("открыли доступ" in x for x in to_chat(7)))
+
+    # ── /msg ──
+    def _fail_send(self, code, desc):
+        def boom(*a, **k):
+            raise FakeApiExc(code, desc)
+        B.bot.send_message = boom
+
+    def tearDown(self):
+        B.bot.__dict__.pop("send_message", None)
+
+    def test_msg_delivers_and_confirms(self):
+        self.add_user(43)
+        B.cmd_msg(msg("/msg 43 привет\nвторая строка", user=42))
+        self.assertEqual(to_chat(43), ["✉️ Сообщение от админа:\nпривет\nвторая строка"])
+        self.assertIn("Отправлено", self.names("reply_to")[-1].args[1])
+
+    def test_msg_blocked_user_reported(self):
+        self.add_user(43)
+        self._fail_send(403, "Forbidden: bot was blocked by the user")
+        B.cmd_msg(msg("/msg 43 hi", user=42))
+        self.assertIn("заблокировал", self.names("reply_to")[-1].args[1])
+
+    def test_msg_unknown_id_and_usage(self):
+        B.cmd_msg(msg("/msg 999 hi", user=42))
+        self.assertIn("не найден", self.names("reply_to")[-1].args[1])
+        B.cmd_msg(msg("/msg 42", user=42))
+        self.assertIn("Использование", self.names("reply_to")[-1].args[1])
+
+    def test_msg_admin_only(self):
+        self.add_user(43)
+        B.cmd_msg(msg("/msg 43 hi", user=43))
+        self.assertEqual(to_chat(43), [])
+        self.assertEqual(self.names("reply_to"), [])
 
     def test_non_admin_cannot_approve(self):
         self.add_user(43)
