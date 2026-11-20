@@ -35,6 +35,17 @@ class Env(unittest.TestCase):
         self.assertEqual([os.environ[k] for k in "ABCDE"], ["1", "two words", "x", "C:\\bananagpt-data", "a=b"])
         self.assertEqual(os.environ["KEEP"], "old")
 
+    def test_dotenv_mixed_encodings_do_not_crash(self):
+        f = self.tmp / ".env"
+        data = (b"\xef\xbb\xbfA=1\r\n" + "# комментарий".encode("utf-8") + b"\r\n"
+                + b"B=" + "G:\\Мой диск\\x".encode("cp1251") + b"\r\n"      # дописано PowerShell 5.1 в cp1251
+                + b"\xef\xbb\xbfC=" + "ёж".encode("utf-8") + b"\n")          # BOM в середине файла
+        f.write_bytes(data)
+        for k in "ABC":
+            os.environ.pop(k, None)
+        localmode.load_dotenv(f)
+        self.assertEqual((os.environ["A"], os.environ["B"], os.environ["C"]), ("1", "G:\\Мой диск\\x", "ёж"))
+
     def test_dotenv_missing_file_is_noop(self):
         self.assertEqual(localmode.load_dotenv(self.tmp / "nope.env"), 0)
 

@@ -16,11 +16,24 @@ EXIT_CONFIG, EXIT_ALREADY_RUNNING = 2, 3  # run.bat на этих кодах н�
 _lock_handle = None  # держим открытым до конца процесса — ОС сама снимает блокировку при любом завершении
 
 
+def decode_lines(raw):
+    """Строки файла по одной: UTF-8, а если строка не UTF-8 (PowerShell 5.1 дописывает в cp1251, Блокнот иногда сохраняет
+    в ANSI) — cp1251. Так смешанный файл не роняет бота. BOM в начале любой строки отбрасывается."""
+    out = []
+    for chunk in raw.split(b"\n"):
+        try:
+            text = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            text = chunk.decode("cp1251", errors="replace")
+        out.append(text.lstrip("\ufeff").rstrip("\r"))
+    return out
+
+
 def load_dotenv(path=None):
     """Читает .env рядом с ботом. Уже заданные переменные окружения не затирает. Нет файла — ничего не делает."""
     path = Path(path) if path else HERE / ".env"
     try:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        lines = decode_lines(path.read_bytes())
     except OSError:
         return 0
     n = 0
