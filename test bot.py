@@ -4,6 +4,7 @@
 """
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -419,6 +420,31 @@ class BotFlow(unittest.TestCase):
                                            message=SimpleNamespace(chat=SimpleNamespace(id=42), message_id=9)))
         self.assertTrue(B.is_allowed(7))
         self.assertTrue(any("открыли доступ" in x for x in to_chat(7)))
+
+    # ── локальный режим / конфликт getUpdates ──
+    def test_conflict_409_warns_admins_once(self):
+        sent = []
+        orig, B.notify_admins_async = B.notify_admins_async, sent.append
+        B._conflict["last"] = 0.0
+        try:
+            h = B._PollingConflictWatch()
+            rec = logging.LogRecord("TeleBot", logging.ERROR, __file__, 1,
+                "Infinity polling exception: Error code: 409. Description: Conflict: terminated by other getUpdates request", (), None)
+            h.emit(rec)
+            h.emit(rec)  # повтор в пределах 30 минут — молчим
+            h.emit(logging.LogRecord("TeleBot", logging.ERROR, __file__, 1, "другая ошибка", (), None))
+        finally:
+            B.notify_admins_async = orig
+        self.assertEqual(len(sent), 1)
+        self.assertIn("два экземпляра", sent[0])
+
+    def test_cookie_hint_depends_on_mode(self):
+        self.assertIn("Render", B._cookie_fix_hint())
+        B.LOCAL = True
+        try:
+            self.assertIn(".env", B._cookie_fix_hint())
+        finally:
+            B.LOCAL = False
 
     # ── /msg ──
     def _fail_send(self, code, desc):

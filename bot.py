@@ -31,6 +31,12 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import localmode
+
+localmode.load_dotenv()  # .env рядом с ботом (только локально; на Render файла нет — ничего не происходит)
+DATA_DIR = localmode.data_dir()  # None на Render: тогда всё как раньше
+localmode.prepare(DATA_DIR)  # папки + GEMINI_COOKIE_PATH до импорта gemini_webapi
+
 import telebot
 from telebot.types import (
     InlineKeyboardButton,
@@ -66,6 +72,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("banan")
+localmode.setup_log_file(DATA_DIR, os.getenv("LOG_LEVEL", "INFO"))
+LOCAL = DATA_DIR is not None  # локальный запуск на ПК
+USE_POLLING = localmode.use_polling()
 
 # ───────────────────────── настройки ─────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -81,6 +90,9 @@ GEMINI_CONCURRENCY = max(1, int(os.getenv("GEMINI_CONCURRENCY", "2")))
 HEALTH_INTERVAL = int(os.getenv("HEALTH_INTERVAL", "3600"))  # проверка Gemini раз в N секунд, 0 = выкл.
 
 if not TELEGRAM_TOKEN:
+    if LOCAL:
+        log.error("Не задан TELEGRAM_TOKEN. Скопируй .env.example в .env и впиши токен от @BotFather.")
+        sys.exit(localmode.EXIT_CONFIG)
     raise RuntimeError("Не задана переменная окружения TELEGRAM_TOKEN!")
 
 
@@ -102,10 +114,12 @@ DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "30"))  # запросов в ден�
 ALLOW_REQUESTS = os.getenv("ALLOW_REQUESTS", "1") != "0"  # можно ли чужим подавать заявку на доступ
 TZ_OFFSET = int(os.getenv("TZ_OFFSET_HOURS", "3"))  # часовой пояс для «дня» (3 = Москва)
 
-WORKDIR = Path(tempfile.gettempdir()) / "bananbot_work"
+# Локально все файлы лежат в DATA_DIR; на Render — во временной папке, как раньше.
+WORKDIR = (DATA_DIR / "work") if LOCAL else Path(tempfile.gettempdir()) / "bananbot_work"
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
-store = Store(os.getenv("DATABASE_URL", ""), os.getenv("DB_PATH", "bananbot.db"))
+# База: DATABASE_URL → Postgres; иначе SQLite (DB_PATH, а локально по умолчанию DATA_DIR/bananbot.db).
+store = Store(os.getenv("DATABASE_URL", ""), os.getenv("DB_PATH") or str(DATA_DIR / "bananbot.db" if LOCAL else "bananbot.db"))
 registry = UserRegistry(store, ADMIN_IDS, MAX_USERS, DAILY_LIMIT, TZ_OFFSET)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, num_threads=BOT_THREADS)
@@ -214,6 +228,16 @@ def install_cookie_watch():
     return True
 
 
+def _cookie_fix_hint():
+    """Где админу обновить куки: локально — файл .env + перезапуск, на Render — Environment."""
+    if LOCAL:
+        return ("Сессия Gemini истекла. Обнови GEMINI_SECURE_1PSID и GEMINI_SECURE_1PSIDTS в файле .env рядом с ботом "
+                "и перезапусти run.bat (куки: Firefox/Chrome → приватное окно → gemini.google.com → войти → F12 → "
+                "Storage/Application → Cookies → скопировать значения, окно закрыть без выхода из аккаунта).")
+    return ("Обнови GEMINI_SECURE_1PSID и GEMINI_SECURE_1PSIDTS в Render → Environment "
+            "(куки из Firefox, приватное окно, закрыть без выхода из аккаунта).")
+
+
 def update_cookie_state(ok, detail=""):
     prev = cookie_watch["ok"]
     cookie_watch["ok"], cookie_watch["detail"] = ok, detail
@@ -222,8 +246,7 @@ def update_cookie_state(ok, detail=""):
         if prev is not False or now - cookie_watch["last_alert"] > COOKIE_REALERT_SEC:
             cookie_watch["last_alert"] = now
             notify_admins_async(
-                "🚨 Gemini не принимает куки (гостевой режим)%s.\n\nОбнови GEMINI_SECURE_1PSID и GEMINI_SECURE_1PSIDTS "
-                "в Render → Environment (куки из Firefox, приватное окно, закрыть без выхода из аккаунта)." % (" — " + detail if detail else ""))
+                "🚨 Gemini не принимает куки (гостевой режим)%s.\n\n%s" % (" — " + detail if detail else "", _cookie_fix_hint()))
     elif prev is False:
         notify_admins_async("✅ Куки Gemini снова работают.")
 
@@ -715,7 +738,7 @@ def health_check_once():
         log.warning("health-check: %s (подряд: %d)", e, _health["fails"])
         if _health["fails"] >= 2 and not _health["alerted"]:
             _health["alerted"] = True
-            notify_admins_async("🚨 Gemini не отвечает уже %d проверки подряд: %s\nПроверь куки (/cookies) и логи Render." % (_health["fails"], type(e).__name__))
+            notify_admins_async("🚨 Gemini не отвечает уже %d проверки подряд: %s\nПроверь куки (/cookies) и логи %s." % (_health["fails"], type(e).__name__, "бота (bot.log)" if LOCAL else "Render"))
         return False
 
 
@@ -2233,7 +2256,48 @@ def _register_commands():
         log.warning("set_my_commands: %s", e)
 
 
+_conflict = {"last": 0.0}
+
+
+class _PollingConflictWatch(logging.Handler):
+    """Ловит ошибку Telegram 409 («terminated by other getUpdates request») в логах telebot и объясняет по-человечески."""
+
+    def emit(self, record):
+        try:
+            text = record.getMessage()
+        except Exception:
+            return
+        if "terminated by other getUpdates" not in text and "Conflict: terminated" not in text:
+            return
+        now = time.time()
+        if now - _conflict["last"] < 1800:
+            return
+        _conflict["last"] = now
+        msg = ("⚠️ Запущено два экземпляра бота с одним токеном (конфликт getUpdates, Telegram 409). "
+               "Бот может терять сообщения. Останови лишний: локальный (run.bat на ПК) или сервис на Render.")
+        log.error(msg)
+        notify_admins_async(msg)
+
+
+def _install_conflict_watch():
+    logging.getLogger("TeleBot").addHandler(_PollingConflictWatch())
+
+
 def main():
+    if LOCAL:
+        if not localmode.acquire_single_instance(DATA_DIR):
+            log.error("Бот уже запущен на этом ПК (другое окно run.bat или фоновый процесс). Закрой его и запусти снова. "
+                      "Два экземпляра с одним токеном конфликтуют (getUpdates).")
+            sys.exit(localmode.EXIT_ALREADY_RUNNING)
+        if store.kind == "sqlite":
+            try:
+                made = localmode.backup_sqlite(store.path, DATA_DIR / "backup", keep=7)
+                if made:
+                    log.info("Резервная копия базы: %s", made)
+            except Exception as e:
+                log.warning("Резервная копия базы не сделана: %s", e)
+        log.info("Локальный режим: данные в %s", DATA_DIR)
+    _install_conflict_watch()
     if harden_process():
         log.info("Процесс защищён от чтения /proc/<pid>/environ дочерними процессами")
     init_state()
@@ -2243,8 +2307,9 @@ def main():
     except (ValueError, OSError) as e:
         log.warning("SIGTERM-обработчик не установлен: %s", e)
     start_cookie_saver()
-    start_health_server()
-    start_keepalive()
+    if not USE_POLLING:  # на ПК порт и самопинг не нужны; на Render — как раньше
+        start_health_server()
+        start_keepalive()
     if not ADMIN_IDS:
         log.warning("Не задан ALLOWED_IDS/ADMIN_IDS — бот никому не отвечает, кроме /myid. Задай ALLOWED_IDS.")
     try:
@@ -2258,6 +2323,10 @@ def main():
     while True:
         try:
             bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
+        except KeyboardInterrupt:
+            log.info("Остановка по Ctrl+C — сохраняю куки и выхожу")
+            _shutdown_save()
+            _exit(0)
         except Exception as e:
             log.error("Перезапуск polling после сбоя: %s", e)
             time.sleep(5)

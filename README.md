@@ -11,6 +11,9 @@ Telegram-бот поверх личного веб-аккаунта Gemini (ку
 | `chartbox.py` | изолированное построение графиков |
 | `docgen.py` | настоящие PDF и DOCX |
 | `store.py`, `users.py` | база (SQLite / Postgres), пользователи, лимиты |
+| `localmode.py` | локальный запуск на ПК: `.env`, папка данных, лог-файл, защита от двойного запуска, бэкап |
+| `run.bat`, `.env.example` | запуск на Windows одним файлом |
+| `migrate_to_postgres.py` | перенос локальной SQLite-базы в Postgres (Render) |
 | `requirements.txt` | зависимости |
 | `Dockerfile`, `.dockerignore` | запуск в Docker не от root (по желанию) |
 | `Procfile`, `.gitignore`, `README.md`, `test_bot.py` | вспомогательные |
@@ -30,9 +33,25 @@ Telegram-бот поверх личного веб-аккаунта Gemini (ку
 | `GEMINI_CONCURRENCY` | нет | сколько запросов к Gemini одновременно (2) |
 | `HEALTH_INTERVAL` | нет | проверка Gemini раз в N секунд (3600), 0 = выкл. |
 | `DEFAULT_MODEL`, `MODEL_TIMEOUT`, `REQUEST_TIMEOUT`, `BOT_THREADS`, `LOG_LEVEL` | нет | см. комментарии в `bot.py` |
-| `GEMINI_COOKIE_PATH` | нет | `/tmp/gemini_webapi` |
+| `GEMINI_COOKIE_PATH` | нет | `/tmp/gemini_webapi` (локально ставится сам: `DATA_DIR\\gemini_cookies`) |
+| `USE_POLLING` | нет | `1` — локальный режим на ПК (без health-сервера и самопинга). На Render не задавать |
+| `DATA_DIR` | нет | папка всех локальных данных; пусто + `USE_POLLING=1` → папка `data` рядом с ботом. На Render не задавать |
 | `COOKIE_KEY` | нет | свой ключ шифрования сохранённых кук (по умолчанию берётся из токена бота) |
 | `COOKIE_SAVE_INTERVAL` | нет | как часто сохранять куки в базу, секунд (300), 0 = выкл. |
+
+## Локальный запуск на Windows
+Бот и на Render работает через polling (не webhook); `USE_POLLING=1` лишь включает локальный режим.
+1. Установи Python 3.10+ (python.org, галка **Add python to PATH**).
+2. Скопируй `.env.example` → `.env`, впиши `TELEGRAM_TOKEN`, `GEMINI_SECURE_1PSID`, `GEMINI_SECURE_1PSIDTS`, `ALLOWED_IDS`.
+   `DATABASE_URL` оставь пустым → SQLite в `DATA_DIR\bananbot.db`. (Или впиши ту же строку Neon, что на Render — тогда данные общие и переносить ничего не надо.)
+3. Запусти `run.bat`: создаст venv, поставит зависимости, запустит бота; при падении перезапустит через 10 с. Остановка — Ctrl+C.
+4. В `DATA_DIR`: `bananbot.db` (пользователи, диалоги, зашифрованные куки), `work\` (файлы), `gemini_cookies\`, `bot.log` (ротация 5×5 МБ), `backup\` (копия базы раз в день при старте, последние 7).
+5. Куки: Firefox/Chrome → приватное окно → gemini.google.com → войти → F12 → Storage/Application → Cookies → скопировать `__Secure-1PSID` и `__Secure-1PSIDTS` в `.env` → окно закрыть без выхода из аккаунта.
+   Когда сессия истекла, админ получает в Telegram сообщение «🚨 Gemini не принимает куки» с инструкцией; обнови `.env` и перезапусти `run.bat`.
+6. Два экземпляра с одним токеном конфликтуют: на ПК второй `run.bat` откажется стартовать, а если параллельно оживёт Render, админ получит «два экземпляра бота (409)».
+
+**Возврат на Render:** останови `run.bat` → при желании `venv\Scripts\python migrate_to_postgres.py --from <DATA_DIR>\bananbot.db --to "<DATABASE_URL с Render>"`
+(сначала без `--apply` — пробный прогон; куки не переносятся) → обнови куки в Render и включи сервис.
 
 ## Бесплатная база (Neon)
 1. neon.tech → Sign up → Create project (регион поближе, без карты).
