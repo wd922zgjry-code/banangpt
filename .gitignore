@@ -3,3 +3,14 @@ __pycache__/
 *.db
 .env
 .venv/
+
+# локальный запуск на ПК: секреты и данные никогда не коммитим
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+data/
+bananagpt-data/
+*.lock
+bananbot.db-*

@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY bot.py textfmt.py chartbox.py docgen.py store.py users.py ./
+COPY bot.py textfmt.py chartbox.py docgen.py store.py users.py localmode.py ./
 
 USER bot
 CMD ["python", "bot.py"]
