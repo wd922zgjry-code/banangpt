@@ -80,6 +80,39 @@ USE_POLLING = localmode.use_polling()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 SECURE_1PSID = os.getenv("GEMINI_SECURE_1PSID", "").strip()
 SECURE_1PSIDTS = os.getenv("GEMINI_SECURE_1PSIDTS", "").strip() or None
+
+
+def parse_cookie_header(raw):
+    """'a=1; b=2' (можно с префиксом 'Cookie:' и переносами строк) -> {'a': '1', 'b': '2'}."""
+    raw = (raw or "").strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw[7:]
+    out = {}
+    for part in raw.replace("\r", " ").replace("\n", " ").split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name.strip():
+            out[name.strip()] = value.strip()
+    return out
+
+
+def load_extra_cookies():
+    """Полный набор кук браузера: GEMINI_COOKIE_HEADER (строка Cookie) или GEMINI_COOKIES_FILE (путь к файлу с ней).
+    Нужен, если Google не принимает одни __Secure-1PSID/1PSIDTS (редирект на ServiceLogin)."""
+    raw = os.getenv("GEMINI_COOKIE_HEADER", "")
+    path = os.getenv("GEMINI_COOKIES_FILE", "").strip()
+    if not raw.strip() and path:
+        try:
+            raw = Path(os.path.expandvars(os.path.expanduser(path))).read_text(encoding="utf-8-sig")
+        except OSError as e:
+            log.error("Не удалось прочитать GEMINI_COOKIES_FILE (%s): %s", path, e)
+    return parse_cookie_header(raw)
+
+
+EXTRA_COOKIES = load_extra_cookies()
+if EXTRA_COOKIES:  # значения из полного набора важнее отдельных переменных
+    SECURE_1PSID = EXTRA_COOKIES.get("__Secure-1PSID") or SECURE_1PSID
+    SECURE_1PSIDTS = EXTRA_COOKIES.get("__Secure-1PSIDTS") or SECURE_1PSIDTS
+    log.info("Полный набор кук Gemini: %d шт. (имена: %s)", len(EXTRA_COOKIES), ", ".join(sorted(EXTRA_COOKIES)))
 # Необязательный прокси только для запросов к Gemini (http://host:port или socks5://host:port), например локальный порт VPN-клиента.
 GEMINI_PROXY = os.getenv("GEMINI_PROXY", "").strip() or None
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "150"))
@@ -304,7 +337,10 @@ def decrypt_text(blob, key=None):
 
 def _env_fp():
     """Отпечаток кук из переменных окружения: изменились — значит, админ обновил их вручную."""
-    return hashlib.sha256(("%s|%s" % (SECURE_1PSID, SECURE_1PSIDTS or "")).encode("utf-8")).hexdigest()[:16]
+    raw = "%s|%s" % (SECURE_1PSID, SECURE_1PSIDTS or "")
+    if EXTRA_COOKIES:  # без полного набора строка прежняя — отпечаток на Render не меняется
+        raw += "|" + json.dumps(EXTRA_COOKIES, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _read_cookie(client, name):
@@ -604,6 +640,9 @@ patch_gemini_init_rpc(GeminiClient)
 async def _init_client(psid, psidts):
     # ВАЖНО: без proxies= — в новых gemini-webapi аргумент называется proxy (и он необязателен)
     client = GeminiClient(psid, psidts, **({"proxy": GEMINI_PROXY} if GEMINI_PROXY else {}))
+    extra = {k: v for k, v in EXTRA_COOKIES.items() if k not in ("__Secure-1PSID", "__Secure-1PSIDTS")}
+    if extra:  # остальные куки браузера; 1PSID/1PSIDTS идут отдельно (они могут быть свежее, из базы)
+        client.cookies = extra
     cookie_watch["unauth"] = False
     cookie_store["start"] = (psid, psidts)
     await client.init(timeout=60, auto_close=False, auto_refresh=True)

@@ -146,6 +146,41 @@ class GeminiInit(unittest.TestCase):
         self.assertFalse(self._load_patch()(Old))
 
 
+class CookieHeader(unittest.TestCase):
+    @staticmethod
+    def _funcs():
+        import re
+        src = (Path(__file__).resolve().parent / "bot.py").read_text(encoding="utf-8")
+        m = re.search(r"def parse_cookie_header\(raw\):.*?\n\n\ndef load_extra_cookies\(\):.*?return parse_cookie_header\(raw\)\n", src, re.S)
+        ns = {"os": os, "Path": Path, "log": logging.getLogger("t")}
+        exec(m.group(0), ns)
+        return ns
+
+    def test_parse(self):
+        f = self._funcs()["parse_cookie_header"]
+        self.assertEqual(f("Cookie: a=1; b=x=y;  c = 3 ;;bad;\n d=4"), {"a": "1", "b": "x=y", "c": "3", "d": "4"})
+        self.assertEqual(f(""), {})
+        self.assertEqual(f(None), {})
+
+    def test_file_and_env(self):
+        ns = self._funcs()
+        tmp = Path(tempfile.mkdtemp()) / "c.txt"
+        tmp.write_text("\ufeffa=1; b=2\n", encoding="utf-8")
+        saved = dict(os.environ)
+        try:
+            os.environ.pop("GEMINI_COOKIE_HEADER", None)
+            os.environ["GEMINI_COOKIES_FILE"] = str(tmp)
+            self.assertEqual(ns["load_extra_cookies"](), {"a": "1", "b": "2"})
+            os.environ["GEMINI_COOKIE_HEADER"] = "z=9"          # строка важнее файла
+            self.assertEqual(ns["load_extra_cookies"](), {"z": "9"})
+            os.environ.pop("GEMINI_COOKIE_HEADER")
+            os.environ["GEMINI_COOKIES_FILE"] = str(tmp) + ".нет"   # нет файла — пусто, без падения
+            self.assertEqual(ns["load_extra_cookies"](), {})
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+
 class Migrate(unittest.TestCase):
     def test_merge_and_dry_run(self):
         tmp = Path(tempfile.mkdtemp())
