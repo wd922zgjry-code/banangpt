@@ -25,6 +25,13 @@ _TMP_DB = os.path.join(tempfile.mkdtemp(), "boot.db")
 os.environ.update(TELEGRAM_TOKEN="1:test", GEMINI_SECURE_1PSID="psid", GEMINI_SECURE_1PSIDTS="psidts",
                   ALLOWED_IDS="42", DB_PATH=_TMP_DB, HEALTH_INTERVAL="0")
 
+try:
+    import matplotlib  # noqa: F401
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+needs_mpl = unittest.skipUnless(HAS_MPL, "нужен matplotlib")
+
 PNG = b"\x89PNG\r\n\x1a\n"
 
 
@@ -273,6 +280,7 @@ class TextFormat(unittest.TestCase):
 
 # ═════════════════ песочница графиков ═════════════════
 class Chartbox(unittest.TestCase):
+    @needs_mpl
     def test_renders_png_and_ignores_savefig_path(self):
         target = Path(tempfile.gettempdir()) / "banan_escape_test.png"
         target.unlink(missing_ok=True)
@@ -282,6 +290,7 @@ class Chartbox(unittest.TestCase):
         self.assertTrue(out[0].startswith(PNG))
         self.assertFalse(target.exists(), "savefig не должен писать куда хочет")
 
+    @needs_mpl
     def test_two_figures_two_pngs(self):
         out = CB.render_charts("import matplotlib.pyplot as plt\nplt.figure(); plt.plot([1])\nplt.figure(); plt.plot([2])")
         self.assertEqual(len(out), 2)
@@ -304,6 +313,7 @@ class Chartbox(unittest.TestCase):
             with self.assertRaises(CB.ChartError, msg=code):
                 CB.render_charts(code, timeout=5)
 
+    @needs_mpl
     def test_infinite_loop_times_out(self):
         with self.assertRaises(CB.ChartError) as cm:
             CB.render_charts("while True:\n    pass", timeout=3)
@@ -819,6 +829,75 @@ class BotFlow(unittest.TestCase):
         self.assertIsNone(B.decrypt_text(broken))                          # подмена
         self.assertIsNone(B.decrypt_text("мусор"))
 
+    def test_full_cookie_set_is_saved_and_restored(self):
+        class Jar(dict):
+            def __init__(self, items):
+                super().__init__(items)
+                self.jar = [SimpleNamespace(name=k, value=v, domain=".google.com") for k, v in items.items()]
+
+        base = {"__Secure-1PSID": "psid", "__Secure-1PSIDTS": "TS-NEW-1234567890123456", "SAPISID": "a-new"}
+        B.EXTRA_COOKIES = {"SID": "s-file", "__Secure-1PSID": "psid", "__Secure-1PSIDTS": "psidts"}
+        B.cookie_store["last_full"] = None
+        try:
+            B.ensure_client_sync()
+            B._gemini_client.cookies = Jar(dict(base, SID="s-1"))
+            self.assertTrue(B.save_cookies_now("тест"))
+            self.assertFalse(B.save_cookies_now("тест"))                    # без изменений — не пишем
+            B._gemini_client.cookies = Jar(dict(base, SID="s-2"))           # поменялась только «лишняя» кука
+            self.assertTrue(B.save_cookies_now("тест"))
+            B.store.flush()
+            self.assertEqual(B.load_saved_cookies()["extra"], {"SAPISID": "a-new", "SID": "s-2"})
+            B.EXTRA_COOKIES = {"SID": "s-edited", "__Secure-1PSID": "psid", "__Secure-1PSIDTS": "psidts"}
+            self.assertIsNone(B.load_saved_cookies())                       # админ поменял файл кук — база не мешает
+        finally:
+            B.EXTRA_COOKIES = {}
+            B.cookie_store["last_full"] = None
+
+    def test_two_cookie_mode_never_stores_extra(self):
+        B.ensure_client_sync()                                              # при подключении куки уже сохраняются
+        B.store.flush()
+        self.assertNotIn("extra", B.load_saved_cookies())
+
+    def test_users_get_notice_when_session_is_down_admin_does_not(self):
+        self.add_user(43)
+        B.cookie_watch["ok"] = False
+        try:
+            self.assertFalse(B._cookies_gate(msg("hi", user=43)))
+            self.assertIn("временно недоступен", self.names("reply_to")[-1].args[1])
+            self.assertTrue(B._cookies_gate(msg("hi", user=42)))            # админ работает и в гостевом режиме
+            B.cookie_watch["ok"] = None
+            self.assertTrue(B._cookies_gate(msg("hi", user=43)))            # ещё не проверялись — пускаем
+        finally:
+            B.cookie_watch["ok"] = None
+
+    def test_heartbeat_pings_url(self):
+        import http.server
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        old = dict(os.environ)
+        os.environ["HEARTBEAT_URL"] = "http://127.0.0.1:%d/ping/xyz" % srv.server_port
+        try:
+            B.start_heartbeat()
+            end = time.time() + 3
+            while not hits and time.time() < end:
+                time.sleep(0.05)
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+            srv.shutdown()
+        self.assertEqual(hits[:1], ["/ping/xyz"])
+
     def test_rotated_cookies_are_saved_and_used_after_restart(self):
         B.ensure_client_sync()
         self.assertEqual(FakeState.client_args[-1], ("psid", "psidts"))
@@ -1137,6 +1216,7 @@ class BotFlow(unittest.TestCase):
         self.assertTrue(any("недоступна" in t for t in texts), texts)
 
     # ── графики ──
+    @needs_mpl
     def test_chart_flow_sends_photo_with_clean_caption(self):
         FakeState.reply = "**Решение:** y = x**2\n" + GOOD_CHART
         B.handle_text(msg("построй график"))
@@ -1155,6 +1235,7 @@ class BotFlow(unittest.TestCase):
         self.assertEqual(self.names("send_photo"), [])
         self.assertTrue(any("График построить не удалось" in t for t in sent_texts()))
 
+    @needs_mpl
     def test_broken_chart_code_gets_one_fix_attempt(self):
         def reply(prompt, model, files):
             return "ответ\n" + GOOD_CHART if prompt.startswith("Твой код matplotlib не выполнился") else "ответ\n```python\nimport matplotlib.pyplot as plt\nplt.plot(\n```"
@@ -1172,6 +1253,7 @@ class BotFlow(unittest.TestCase):
         self.assertEqual(doc.data.decode(), "Итог: $100 и жирный")
         self.assertTrue(any("не собрать" in t for t in sent_texts()))
 
+    @needs_mpl
     def test_real_pdf_with_chart_from_marker(self):
         FakeState.reply = "[SEND_AS_FILE:solution.pdf]\n**Дано**\nB = F / (I * l)\nОтвет: 9 Н\n" + GOOD_CHART
         B.handle_text(msg("реши задачу и дай pdf"))
@@ -1180,6 +1262,7 @@ class BotFlow(unittest.TestCase):
         self.assertTrue(doc.data.startswith(b"%PDF"))
         self.assertIn(b"/Image", doc.data)  # график вставлен рисунком
 
+    @needs_mpl
     def test_real_docx_from_user_phrase(self):
         FakeState.reply = "Конспект\n• пункт один\n• пункт два\n" + GOOD_CHART
         B.handle_text(msg("сделай конспект по сопромату в word"))
