@@ -567,6 +567,38 @@ def set_user_model(chat_id, value):
     registry.set_pref(chat_id, model="auto" if value is None else value)
 
 
+_INIT_RPC_EXTRA = ("_fetch_preferences", "_sync_activity", "_fetch_recent_chats", "_fetch_usage_info",
+                   "_fetch_quota", "_fetch_extra_quota", "_fetch_abuse_status")
+INIT_RPC_STEP_TIMEOUT = 15
+
+
+def patch_gemini_init_rpc(cls, step_timeout=INIT_RPC_STEP_TIMEOUT):
+    """gemini-webapi 2.x при init() делает ещё 7 служебных запросов (настройки, квоты…) только для залогиненного
+    аккаунта. Если любой из них виснет, весь старт бота зависает. Боту они не нужны (нужны список моделей и ответы),
+    поэтому каждый получает свой таймаут, а сбой только пишется в лог. Для версий без _init_rpc — ничего не делает."""
+    if not hasattr(cls, "_init_rpc") or not hasattr(cls, "_fetch_user_status"):
+        return False
+
+    async def _tolerant_init_rpc(self):
+        await self._fetch_user_status()  # от него зависит список моделей — ошибка здесь настоящая
+        for name in _INIT_RPC_EXTRA:
+            fn = getattr(self, name, None)
+            if fn is None:
+                continue
+            try:
+                await asyncio.wait_for(fn(), step_timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("Gemini: служебный запрос %s пропущен (%s: %s)", name, type(e).__name__, e)
+
+    cls._init_rpc = _tolerant_init_rpc
+    return True
+
+
+patch_gemini_init_rpc(GeminiClient)
+
+
 async def _init_client(psid, psidts):
     # ВАЖНО: без proxies= — в новых gemini-webapi аргумент называется proxy (и он необязателен)
     client = GeminiClient(psid, psidts)
@@ -2232,8 +2264,13 @@ def _warmup():
         ensure_client_sync()
         log.info("Gemini подключён. Модель по умолчанию: %s", default_model() or "авто (аккаунт)")
     except Exception as e:
-        log.error("Gemini не подключился (проверь GEMINI_SECURE_1PSID / 1PSIDTS): %s", e)
-        update_cookie_state(False, type(e).__name__)
+        log.error("Gemini не подключился (%s): %s", type(e).__name__, e)
+        if isinstance(e, (asyncio.TimeoutError, TimeoutError, OSError)):
+            # таймаут/сеть — это не «куки протухли»; следующее сообщение пользователя повторит подключение
+            notify_admins_async("⚠️ Gemini не ответил при подключении (%s). Это сеть или сбой Google, куки тут ни при чём. "
+                                "Бот повторит попытку при первом сообщении." % type(e).__name__)
+        else:
+            update_cookie_state(False, type(e).__name__)
 
 
 def _register_commands():

@@ -99,6 +99,53 @@ class Env(unittest.TestCase):
         self.assertIsNone(localmode.backup_sqlite(self.tmp / "none.db", bdir))
 
 
+class GeminiInit(unittest.TestCase):
+    """patch_gemini_init_rpc: зависший служебный запрос не должен блокировать старт. bot.py не импортируем — копируем логику через exec."""
+
+    @staticmethod
+    def _load_patch():
+        import asyncio
+        import re
+        src = (Path(__file__).resolve().parent / "bot.py").read_text(encoding="utf-8")
+        m = re.search(r"_INIT_RPC_EXTRA = .*?\npatch_gemini_init_rpc\(GeminiClient\)", src, re.S)
+        ns = {"asyncio": asyncio, "log": logging.getLogger("t")}
+        exec(m.group(0).replace("patch_gemini_init_rpc(GeminiClient)", ""), ns)
+        return ns["patch_gemini_init_rpc"]
+
+    def test_hanging_step_is_skipped(self):
+        import asyncio
+        calls = []
+
+        class C:
+            async def _fetch_user_status(self): calls.append("status")
+            async def _fetch_preferences(self): await asyncio.sleep(60)   # виснет
+            async def _sync_activity(self): raise RuntimeError("boom")    # падает
+            async def _fetch_quota(self): calls.append("quota")           # работает
+            async def _init_rpc(self): raise AssertionError("старый метод не должен вызываться")
+
+        self.assertTrue(self._load_patch()(C, step_timeout=0.2))
+        t = time.time()
+        asyncio.run(C()._init_rpc())
+        self.assertLess(time.time() - t, 3)
+        self.assertEqual(calls, ["status", "quota"])
+
+    def test_user_status_error_still_raises(self):
+        import asyncio
+
+        class C:
+            async def _fetch_user_status(self): raise ConnectionError("net")
+            async def _init_rpc(self): pass
+
+        self._load_patch()(C, step_timeout=0.2)
+        with self.assertRaises(ConnectionError):
+            asyncio.run(C()._init_rpc())
+
+    def test_unknown_library_version_untouched(self):
+        class Old:
+            pass
+        self.assertFalse(self._load_patch()(Old))
+
+
 class Migrate(unittest.TestCase):
     def test_merge_and_dry_run(self):
         tmp = Path(tempfile.mkdtemp())
