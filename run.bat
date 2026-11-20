@@ -9,7 +9,7 @@ set USE_POLLING=1
 
 if not exist ".env" (
     echo [!] Нет файла .env. Скопируй .env.example в .env и заполни токен и куки.
-    pause
+    if not defined NOPAUSE pause
     exit /b 2
 )
 
@@ -19,7 +19,7 @@ if not exist "venv\Scripts\python.exe" (
     py -3 -m venv venv 2>nul || python -m venv venv
     if errorlevel 1 (
         echo [!] Не нашёл Python 3.10+. Установи с python.org и поставь галку "Add python to PATH".
-        pause
+        if not defined NOPAUSE pause
         exit /b 2
     )
 )
@@ -31,7 +31,7 @@ if errorlevel 1 (
     "venv\Scripts\python.exe" -m pip install -r requirements.txt
     if errorlevel 1 (
         echo [!] Не удалось установить зависимости. Проверь интернет и запусти снова.
-        pause
+        if not defined NOPAUSE pause
         exit /b 2
     )
     copy /y requirements.txt "%STAMP%" >nul
@@ -59,5 +59,5 @@ timeout /t 10 /nobreak >nul
 goto :loop
 
 :end
-pause
+if not defined NOPAUSE pause
 endlocal
