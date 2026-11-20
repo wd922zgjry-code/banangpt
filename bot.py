@@ -108,13 +108,12 @@ def load_extra_cookies():
     return parse_cookie_header(raw)
 
 
+_MAIN_COOKIES = ("__Secure-1PSID", "__Secure-1PSIDTS")
 EXTRA_COOKIES = load_extra_cookies()
 if EXTRA_COOKIES:  # значения из полного набора важнее отдельных переменных
     SECURE_1PSID = EXTRA_COOKIES.get("__Secure-1PSID") or SECURE_1PSID
     SECURE_1PSIDTS = EXTRA_COOKIES.get("__Secure-1PSIDTS") or SECURE_1PSIDTS
     log.info("Полный набор кук Gemini: %d шт. (имена: %s)", len(EXTRA_COOKIES), ", ".join(sorted(EXTRA_COOKIES)))
-# Необязательный прокси только для запросов к Gemini (http://host:port или socks5://host:port), например локальный порт VPN-клиента.
-GEMINI_PROXY = os.getenv("GEMINI_PROXY", "").strip() or None
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "150"))
 # Если выбранная модель молчит дольше этого — бот сам повторяет запрос в режиме «авто»
 MODEL_TIMEOUT = int(os.getenv("MODEL_TIMEOUT", "60"))
@@ -213,6 +212,26 @@ def start_keepalive():
     log.info("Keepalive-пинг %s каждые %s с", url, interval)
 
 
+def start_heartbeat():
+    """Внешний «пульс»: раз в HEARTBEAT_INTERVAL секунд GET на HEARTBEAT_URL (например, бесплатный healthchecks.io).
+    Пульс пропал (ПК выключен, бот завис) — сервис сам пришлёт уведомление. Адрес секретный, в лог не пишется."""
+    url = os.getenv("HEARTBEAT_URL", "").strip()
+    if not url:
+        return
+    interval = max(30, int(os.getenv("HEARTBEAT_INTERVAL", "300")))
+
+    def loop():
+        while True:
+            try:
+                urllib.request.urlopen(url, timeout=15).read(16)
+            except Exception as e:
+                log.warning("heartbeat: %s", type(e).__name__)
+            time.sleep(interval)
+
+    threading.Thread(target=loop, daemon=True).start()
+    log.info("Heartbeat включён: раз в %s с", interval)
+
+
 # ───────────────────────── статистика ─────────────────────────
 STATS = {"requests": 0, "errors": 0, "timeouts": 0, "fallbacks": 0, "by_model": {}}
 _stats_lock = threading.Lock()
@@ -290,7 +309,7 @@ def update_cookie_state(ok, detail=""):
 # gemini-webapi сам обновляет куки (1PSIDTS) в памяти, но при рестарте контейнера они теряются, а в Render лежит старая
 # копия. Поэтому бот сам кладёт свежие куки в базу (в зашифрованном виде) и при запуске берёт их оттуда.
 # Если ты вручную поменял куки в Render, бот это замечает (по отпечатку переменных) и берёт новые из Render.
-cookie_store = {"start": (None, None), "used": "env", "last_saved": None, "saved_at": 0.0, "via": "", "error": ""}
+cookie_store = {"start": (None, None), "used": "env", "last_saved": None, "last_full": None, "saved_at": 0.0, "via": "", "error": ""}
 _cookie_save_lock = threading.Lock()
 
 
@@ -365,6 +384,21 @@ def _read_cookie(client, name):
     return jar.get(name) if isinstance(jar, dict) else None
 
 
+def _read_all_cookies(client):
+    """Все куки google.com из сессии клиента (имя -> значение). Нужны только в режиме полного набора кук."""
+    out = {}
+    inner = getattr(getattr(client, "cookies", None), "jar", None)
+    if inner is None:
+        return out
+    try:
+        for c in inner:
+            if c.name and c.value and "google" in (c.domain or ""):
+                out[c.name] = c.value
+    except Exception:
+        return {}
+    return out
+
+
 def _read_cached_ts(psid):
     """Запасной путь: файл-кэш 1PSIDTS, который библиотека пишет в GEMINI_COOKIE_PATH."""
     dirs = [os.getenv("GEMINI_COOKIE_PATH", "")]
@@ -434,11 +468,19 @@ def save_cookies_now(reason=""):
                 log.warning("Не смог прочитать обновлённые куки из клиента Gemini — автосохранение не работает")
             cookie_store["error"] = "не удалось прочитать 1PSIDTS из клиента"
             return False
-        if (psid, psidts) == cookie_store["last_saved"]:
+        if not EXTRA_COOKIES and (psid, psidts) == cookie_store["last_saved"]:
             return False
-        payload = json.dumps({"psid": psid, "psidts": psidts, "env_fp": _env_fp(), "saved_at": int(time.time())})
-        registry.store.save_kv("gemini_cookies", encrypt_text(payload))
-        cookie_store.update(last_saved=(psid, psidts), saved_at=time.time(), via=via, error="")
+        data = {"psid": psid, "psidts": psidts, "env_fp": _env_fp(), "saved_at": int(time.time())}
+        extra = {}
+        if EXTRA_COOKIES:  # режим полного набора: остальные куки тоже обновляются, сохраняем и их
+            extra = {k: v for k, v in _read_all_cookies(_gemini_client).items() if k not in _MAIN_COOKIES}
+            if extra:
+                data["extra"] = extra
+        full = (psid, psidts, json.dumps(extra, sort_keys=True))
+        if EXTRA_COOKIES and full == cookie_store.get("last_full"):
+            return False
+        registry.store.save_kv("gemini_cookies", encrypt_text(json.dumps(data)))
+        cookie_store.update(last_saved=(psid, psidts), last_full=full, saved_at=time.time(), via=via, error="")
         log.info("Куки Gemini сохранены в базу (%s; %s; PSIDTS …%s)", reason or "по таймеру", via, psidts[-6:])
         return True
 
@@ -605,42 +647,10 @@ def set_user_model(chat_id, value):
     registry.set_pref(chat_id, model="auto" if value is None else value)
 
 
-_INIT_RPC_EXTRA = ("_fetch_preferences", "_sync_activity", "_fetch_recent_chats", "_fetch_usage_info",
-                   "_fetch_quota", "_fetch_extra_quota", "_fetch_abuse_status")
-INIT_RPC_STEP_TIMEOUT = 15
-
-
-def patch_gemini_init_rpc(cls, step_timeout=INIT_RPC_STEP_TIMEOUT):
-    """gemini-webapi 2.x при init() делает ещё 7 служебных запросов (настройки, квоты…) только для залогиненного
-    аккаунта. Если любой из них виснет, весь старт бота зависает. Боту они не нужны (нужны список моделей и ответы),
-    поэтому каждый получает свой таймаут, а сбой только пишется в лог. Для версий без _init_rpc — ничего не делает."""
-    if not hasattr(cls, "_init_rpc") or not hasattr(cls, "_fetch_user_status"):
-        return False
-
-    async def _tolerant_init_rpc(self):
-        await self._fetch_user_status()  # от него зависит список моделей — ошибка здесь настоящая
-        for name in _INIT_RPC_EXTRA:
-            fn = getattr(self, name, None)
-            if fn is None:
-                continue
-            try:
-                await asyncio.wait_for(fn(), step_timeout)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.warning("Gemini: служебный запрос %s пропущен (%s: %s)", name, type(e).__name__, e)
-
-    cls._init_rpc = _tolerant_init_rpc
-    return True
-
-
-patch_gemini_init_rpc(GeminiClient)
-
-
-async def _init_client(psid, psidts):
+async def _init_client(psid, psidts, saved_extra=None):
     # ВАЖНО: без proxies= — в новых gemini-webapi аргумент называется proxy (и он необязателен)
-    client = GeminiClient(psid, psidts, **({"proxy": GEMINI_PROXY} if GEMINI_PROXY else {}))
-    extra = {k: v for k, v in EXTRA_COOKIES.items() if k not in ("__Secure-1PSID", "__Secure-1PSIDTS")}
+    client = GeminiClient(psid, psidts)
+    extra = {k: v for k, v in {**EXTRA_COOKIES, **(saved_extra or {})}.items() if k not in _MAIN_COOKIES}
     if extra:  # остальные куки браузера; 1PSID/1PSIDTS идут отдельно (они могут быть свежее, из базы)
         client.cookies = extra
     cookie_watch["unauth"] = False
@@ -665,7 +675,8 @@ async def _get_client(force=False):
                 _gemini_client = None
             saved = await loop.run_in_executor(None, load_saved_cookies)
             source = "база" if saved else "env"
-            client = await _init_client(saved["psid"], saved["psidts"]) if saved else await _init_client(SECURE_1PSID, SECURE_1PSIDTS)
+            client = (await _init_client(saved["psid"], saved["psidts"], saved.get("extra"))
+                      if saved else await _init_client(SECURE_1PSID, SECURE_1PSIDTS))
             if saved and cookie_watch["unauth"]:
                 log.warning("Куки из базы не подошли — пробую куки из переменных Render")
                 try:
@@ -2119,8 +2130,19 @@ def _report_error(chat_id, wait_msg, e, what="Ошибка"):
         bot.send_message(chat_id, text)
 
 
+def _cookies_gate(message):
+    """True — можно работать. Если Google не принимает куки (гостевой режим), обычным пользователям честно отказываем
+    вместо урезанных гостевых ответов; админ может работать и так (проверять, чинить)."""
+    if cookie_watch["ok"] is False and not registry.is_admin(message.from_user.id):
+        safe_reply(message, "🔧 Сервис временно недоступен: у бота слетела сессия Gemini. Админ уже уведомлён, попробуй позже.")
+        return False
+    return True
+
+
 def _quota_gate(message):
-    """True — можно работать; False — лимит исчерпан (пользователю уже ответили)."""
+    """True — можно работать; False — отказано (пользователю уже ответили): сессия Gemini или дневной лимит."""
+    if not _cookies_gate(message):
+        return False
     ok, used, limit = registry.check_quota(message.from_user.id)
     if not ok:
         safe_reply(message, "📊 Дневной лимит исчерпан: %d/%d. Новый день начнётся в 00:00 (UTC%+d). Лимит можно попросить у админа." % (used, limit, TZ_OFFSET))
@@ -2372,6 +2394,10 @@ def main():
                 made = localmode.backup_sqlite(store.path, DATA_DIR / "backup", keep=7)
                 if made:
                     log.info("Резервная копия базы: %s", made)
+                extra_dir = os.getenv("BACKUP_EXTRA_DIR", "").strip()
+                if extra_dir:
+                    n = localmode.sync_backups(DATA_DIR / "backup", os.path.expandvars(os.path.expanduser(extra_dir)), keep=7)
+                    log.info("Копии базы в %s: добавлено %d", extra_dir, n)
             except Exception as e:
                 log.warning("Резервная копия базы не сделана: %s", e)
         log.info("Локальный режим: данные в %s", DATA_DIR)
@@ -2385,6 +2411,7 @@ def main():
     except (ValueError, OSError) as e:
         log.warning("SIGTERM-обработчик не установлен: %s", e)
     start_cookie_saver()
+    start_heartbeat()
     if not USE_POLLING:  # на ПК порт и самопинг не нужны; на Render — как раньше
         start_health_server()
         start_keepalive()

@@ -5,6 +5,7 @@
 import logging
 import logging.handlers
 import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -118,3 +119,24 @@ def backup_sqlite(db_path, backup_dir, keep=7):
         except OSError:
             pass
     return made
+
+
+def sync_backups(backup_dir, extra_dir, keep=7):
+    """Дублирует последние `keep` копий базы в дополнительную папку (например, синхронизируемую OneDrive/Google Drive),
+    лишнее там удаляет. Возвращает число новых файлов. Внутри — база с зашифрованными куками, ключ из токена бота."""
+    if not extra_dir:
+        return 0
+    extra = Path(extra_dir)
+    extra.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for f in sorted(Path(backup_dir).glob("bananbot-*.db"))[-keep:]:
+        dst = extra / f.name
+        if not dst.exists():
+            shutil.copy2(str(f), str(dst))
+            n += 1
+    for old in sorted(extra.glob("bananbot-*.db"))[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return n
