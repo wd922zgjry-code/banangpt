@@ -115,6 +115,11 @@ for __bx_i, __bx_n in enumerate(__bx_plt.get_fignums()[:%d]):
 
 _LAUNCHER = """\
 import sys
+for _s in (sys.stdout, sys.stderr):  # сообщения об ошибках — в UTF-8 (на Windows по умолчанию cp1251)
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 try:
     import resource
     for _lim, _val in ((resource.RLIMIT_CPU, 20), (resource.RLIMIT_AS, 2 << 30),

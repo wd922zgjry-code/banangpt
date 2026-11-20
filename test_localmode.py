@@ -151,6 +151,29 @@ class SyncBackups(unittest.TestCase):
         self.assertEqual(localmode.sync_backups(src, "", keep=7), 0)
 
 
+class ChildEncoding(unittest.TestCase):
+    """Дочерний процесс на Windows читает stdin в cp1251. PDF-скрипт обязан читать байты как UTF-8."""
+
+    def test_pdf_script_reads_stdin_as_utf8_bytes_even_in_cp1251_console(self):
+        import docgen
+        line = [ln for ln in docgen._PDF_SCRIPT.splitlines() if ln.startswith("data = ")]
+        self.assertEqual(len(line), 1)
+        self.assertNotIn("json.load(sys.stdin)", docgen._PDF_SCRIPT)
+        code = "import sys, json\n%s\nprint(ascii(data['t']))" % line[0]
+        payload = json.dumps({"t": "Москва — столица"}, ensure_ascii=False).encode("utf-8")
+        env = dict(os.environ, PYTHONIOENCODING="cp1251", PYTHONUTF8="0")
+        r = subprocess.run([sys.executable, "-c", code], input=payload, capture_output=True, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace"))
+        self.assertEqual(r.stdout.decode("ascii").strip(), ascii("Москва — столица"))
+
+    def test_old_way_would_have_garbled(self):
+        code = "import sys, json\nprint(ascii(json.load(sys.stdin)['t']))"
+        payload = json.dumps({"t": "Москва"}, ensure_ascii=False).encode("utf-8")
+        env = dict(os.environ, PYTHONIOENCODING="cp1251", PYTHONUTF8="0")
+        r = subprocess.run([sys.executable, "-c", code], input=payload, capture_output=True, env=env)
+        self.assertNotEqual(r.stdout.decode("ascii").strip(), ascii("Москва"))  # воспроизводит баг со скриншота
+
+
 class Migrate(unittest.TestCase):
     def test_merge_and_dry_run(self):
         tmp = Path(tempfile.mkdtemp())

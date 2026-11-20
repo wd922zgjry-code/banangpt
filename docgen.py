@@ -32,7 +32,8 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.font_manager import FontProperties
 
-data = json.load(sys.stdin)
+# stdin читаем как байты в UTF-8: на Windows sys.stdin декодирует по системной кодовой странице (cp1251) -> «РњРѕСЃРєРІР°»
+data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
 out_path = sys.argv[1]
 W, H = 8.27, 11.69
 LM = RM = 0.85
