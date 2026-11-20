@@ -80,6 +80,8 @@ USE_POLLING = localmode.use_polling()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 SECURE_1PSID = os.getenv("GEMINI_SECURE_1PSID", "").strip()
 SECURE_1PSIDTS = os.getenv("GEMINI_SECURE_1PSIDTS", "").strip() or None
+# Необязательный прокси только для запросов к Gemini (http://host:port или socks5://host:port), например локальный порт VPN-клиента.
+GEMINI_PROXY = os.getenv("GEMINI_PROXY", "").strip() or None
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "150"))
 # Если выбранная модель молчит дольше этого — бот сам повторяет запрос в режиме «авто»
 MODEL_TIMEOUT = int(os.getenv("MODEL_TIMEOUT", "60"))
@@ -601,7 +603,7 @@ patch_gemini_init_rpc(GeminiClient)
 
 async def _init_client(psid, psidts):
     # ВАЖНО: без proxies= — в новых gemini-webapi аргумент называется proxy (и он необязателен)
-    client = GeminiClient(psid, psidts)
+    client = GeminiClient(psid, psidts, **({"proxy": GEMINI_PROXY} if GEMINI_PROXY else {}))
     cookie_watch["unauth"] = False
     cookie_store["start"] = (psid, psidts)
     await client.init(timeout=60, auto_close=False, auto_refresh=True)
